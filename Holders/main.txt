@@ -1,0 +1,257 @@
+package holders
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/gagliardetto/solana-go/rpc/jsonrpc"
+)
+
+// HolderInfo is the final output structure.
+type HolderInfo struct {
+	Holder string  `json:"address"`
+	Amount float64 `json:"amount"`
+	Time   string  `json:"time"`
+}
+
+// BitqueryResponse defines the structure for the Bitquery API response.
+type BitqueryResponse struct {
+	Data struct {
+		Solana struct {
+			Transfers []struct {
+				Block struct {
+					Time string `json:"Time"`
+				} `json:"Block"`
+				Transfer struct {
+					Amount   string `json:"Amount"`
+					Receiver struct {
+						Address string `json:"Address"`
+					} `json:"Receiver"`
+				} `json:"Transfer"`
+			} `json:"Transfers"`
+		} `json:"Solana"`
+	} `json:"data"`
+}
+
+// BitqueryClient is a client for interacting with the Bitquery API.
+type BitqueryClient struct {
+	APIURL    string
+	AuthToken string
+}
+
+// NewBitqueryClient creates a new BitqueryClient with default settings.
+func NewBitqueryClient() *BitqueryClient {
+	return &BitqueryClient{
+		APIURL:    "https://streaming.bitquery.io/eap",
+		AuthToken: "Bearer ory_at_XR1sXaw2W5jZh5_pgp1V3Y23eUxyx4OvOCbxboA48cU.zj3YnLzXPtI25CQK36Hc1LYGf5XmCs9WS_9oqVWXLJE", // Replace if needed.
+	}
+}
+
+// UpdateAndGetTransfers first appends new Bitquery data (storing both time and amount)
+// into the JSON file (without updating amounts from current on‑chain data).
+// Then it updates the amount field for every record using the current on‑chain data.
+func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, error) {
+	filename := tokenAddress + ".json"
+	unionMap := make(map[string]HolderInfo)
+	fileLimit := 1000
+
+	// Phase 1: Append new Bitquery data.
+	// If the file exists and is non-empty, use a Bitquery limit of 100 and load its data.
+	if stat, err := os.Stat(filename); err == nil && stat.Size() > 0 {
+		fileLimit = 100
+		content, err := ioutil.ReadFile(filename)
+		if err != nil {
+			return "", fmt.Errorf("error reading existing file: %v", err)
+		}
+		var savedHolders []HolderInfo
+		if err := json.Unmarshal(content, &savedHolders); err != nil {
+			log.Printf("warning: could not unmarshal existing file content, proceeding with empty list: %v", err)
+		} else {
+			for _, rec := range savedHolders {
+				unionMap[rec.Holder] = rec
+			}
+		}
+	}
+
+	// Build the GraphQL query using the determined limit.
+	query := fmt.Sprintf(`
+{
+  Solana {
+    Transfers(
+      where: {Transfer: {Currency: {MintAddress: {is: "%s"}}, Receiver: {Owner: {not: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"}}}}
+      limit: { count: %d }
+      orderBy: { descending: Block_Slot }
+    ) {
+      Block {
+        Time
+      }
+      Transfer {
+        Amount
+        Receiver {
+          Address
+        }
+      }
+    }
+  }
+}
+`, tokenAddress, fileLimit)
+
+	payloadMap := map[string]string{
+		"query":     query,
+		"variables": "{}",
+	}
+	payloadBytes, err := json.Marshal(payloadMap)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", c.APIURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", c.AuthToken)
+
+	clientHTTP := &http.Client{Timeout: 10 * time.Second}
+	resp, err := clientHTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
+	}
+	//fmt.Println("Body", string(body))
+	var bqResponse BitqueryResponse
+	if err := json.Unmarshal(body, &bqResponse); err != nil {
+		return "", fmt.Errorf("failed to unmarshal Bitquery response: %v", err)
+	}
+
+	// Append new Bitquery data to the union map, storing both time and amount.
+	for _, transfer := range bqResponse.Data.Solana.Transfers {
+		address := transfer.Transfer.Receiver.Address
+		if _, exists := unionMap[address]; !exists {
+			// Parse the Bitquery amount (which is a string) into a float64.
+			bqAmount, err := strconv.ParseFloat(transfer.Transfer.Amount, 64)
+			if err != nil {
+				log.Printf("failed to parse bitquery amount %s for address %s: %v", transfer.Transfer.Amount, address, err)
+				bqAmount = 0
+			}
+			//fmt.Println("Pricess", bqAmount, "-", transfer.Transfer.Amount)
+			unionMap[address] = HolderInfo{
+				Holder: address,
+				Time:   transfer.Block.Time,
+				Amount: bqAmount,
+			}
+		}
+	}
+
+	// Write the merged Bitquery data (with Bitquery amounts) to JSON.
+	var mergedHolders []HolderInfo
+	for _, rec := range unionMap {
+		mergedHolders = append(mergedHolders, rec)
+	}
+	jsonOutput, err := json.MarshalIndent(mergedHolders, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("error marshalling merged data: %v", err)
+	}
+	if err := ioutil.WriteFile(filename, jsonOutput, 0644); err != nil {
+		return "", fmt.Errorf("error writing merged file: %v", err)
+	}
+
+	// Phase 2: Update amounts from current on‑chain data.
+	accounts := CurrentHolder(tokenAddress)
+	currentAmounts := make(map[string]float64)
+	for _, acct := range accounts {
+		data := acct.Account.Data.GetBinary()
+		if len(data) < 72 {
+			log.Printf("account data too short for %s", acct.Pubkey)
+			continue
+		}
+		amountRaw := decodeAmount(data[64:72])
+		currentAmounts[acct.Pubkey.String()] = float64(amountRaw)
+	}
+
+	// Update amounts in unionMap using on‑chain values.
+	for addr, rec := range unionMap {
+		if amt, ok := currentAmounts[addr]; ok {
+			rec.Amount = amt
+		} else {
+			continue
+		}
+		unionMap[addr] = rec
+	}
+
+	// Write the final updated JSON with on‑chain amounts.
+	var finalHolders []HolderInfo
+	for _, rec := range unionMap {
+		finalHolders = append(finalHolders, rec)
+	}
+	finalJSON, err := json.MarshalIndent(finalHolders, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("error marshalling final output: %v", err)
+	}
+	if err := ioutil.WriteFile(filename, finalJSON, 0644); err != nil {
+		return "", fmt.Errorf("error writing final file: %v", err)
+	}
+
+	fileContent, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return "", fmt.Errorf("error reading final file: %v", err)
+	}
+	return string(fileContent), nil
+}
+
+// decodeAmount decodes an 8-byte little-endian uint64 value.
+func decodeAmount(data []byte) uint64 {
+	return binary.LittleEndian.Uint64(data)
+}
+
+// CurrentHolder returns the current on‑chain token holders for the given token.
+func CurrentHolder(token string) rpc.GetProgramAccountsResult {
+	quickNodeEndpoint := "https://sleek-wandering-tab.solana-mainnet.quiknode.pro/e5f4c26cc15290eda8ae67162a31a0070cf192d6"
+
+	jsonrpcClient := jsonrpc.NewClient(quickNodeEndpoint)
+	client := rpc.NewWithCustomRPCClient(jsonrpcClient)
+
+	tokenMint := solana.MustPublicKeyFromBase58(token)
+	rawMintStr := string(tokenMint.Bytes())
+
+	filters := []rpc.RPCFilter{
+		{
+			Memcmp: &rpc.RPCFilterMemcmp{
+				Offset: 0,
+				Bytes:  solana.Base58(rawMintStr),
+			},
+		},
+		{
+			DataSize: 165, // Standard SPL token account size.
+		},
+	}
+
+	accounts, err := client.GetProgramAccountsWithOpts(
+		context.Background(),
+		solana.TokenProgramID,
+		&rpc.GetProgramAccountsOpts{
+			Filters: filters,
+		},
+	)
+	if err != nil {
+		log.Fatalf("failed to get program accounts: %v", err)
+	}
+	fmt.Printf("Found %d token accounts for mint %s\n", len(accounts), tokenMint)
+	return accounts
+}

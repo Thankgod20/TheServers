@@ -1,0 +1,149 @@
+package holders
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"strconv"
+	"time"
+)
+
+// HolderInfo is the final output structure.
+type HolderInfo struct {
+	Holder string  `json:"address"`
+	Amount float64 `json:"amount"`
+	Time   string  `json:"time"`
+}
+
+// BitqueryResponse defines the structure for the Bitquery API response.
+type BitqueryResponse struct {
+	Data struct {
+		Solana struct {
+			Transfers []struct {
+				Block struct {
+					Time string `json:"Time"`
+				} `json:"Block"`
+				Transfer struct {
+					Amount   string `json:"Amount"`
+					Receiver struct {
+						Address string `json:"Address"`
+					} `json:"Receiver"`
+				} `json:"Transfer"`
+			} `json:"Transfers"`
+		} `json:"Solana"`
+	} `json:"data"`
+}
+
+// BitqueryClient is a client for interacting with the Bitquery API.
+type BitqueryClient struct {
+	APIURL    string
+	AuthToken string
+}
+
+// NewBitqueryClient creates a new BitqueryClient with default settings.
+func NewBitqueryClient() *BitqueryClient {
+	return &BitqueryClient{
+		APIURL:    "https://streaming.bitquery.io/eap",
+		AuthToken: "Bearer ory_at_d_O6Pt1yoaN4DS3di-43soV82P56bgw3un5BpC8Wqs8.m9fHHLbTMhlQQnJ6kAsJ4BHtzrByjI1p7Dju8MNJw7k", // Replace if needed.
+	}
+}
+
+// UpdateAndGetTransfers fetches transfer data for the provided token address,
+// writes the output to a JSON file named "<tokenAddress>.json", and returns the file's content.
+func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, error) {
+	// GraphQL query to fetch transfers for the given SPL token mint.
+	query := fmt.Sprintf(`
+{
+  Solana {
+    Transfers(
+      where: { Transfer: { Currency: { MintAddress: { is: "%s" } } } }
+      limit: { count: 1000 }
+      orderBy: { descending: Block_Slot }
+    ) {
+      Block {
+        Time
+      }
+      Transfer {
+        Amount
+        Receiver {
+          Address
+        }
+      }
+    }
+  }
+}
+`, tokenAddress)
+
+	// Build the JSON payload with the query and an empty "variables" field.
+	payloadMap := map[string]string{
+		"query":     query,
+		"variables": "{}",
+	}
+	payloadBytes, err := json.Marshal(payloadMap)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	// Create the HTTP request.
+	req, err := http.NewRequest("POST", c.APIURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", c.AuthToken)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	var bqResponse BitqueryResponse
+	if err := json.Unmarshal(body, &bqResponse); err != nil {
+		return "", fmt.Errorf("failed to unmarshal Bitquery response: %v", err)
+	}
+
+	// Build a slice of HolderInfo with address, amount, and time.
+	var holders []HolderInfo
+	for _, transfer := range bqResponse.Data.Solana.Transfers {
+		amount, err := strconv.ParseFloat(transfer.Transfer.Amount, 64)
+		if err != nil {
+			log.Printf("failed to parse amount %q: %v", transfer.Transfer.Amount, err)
+			continue
+		}
+		holders = append(holders, HolderInfo{
+			Holder: transfer.Transfer.Receiver.Address,
+			Amount: amount,
+			Time:   transfer.Block.Time,
+		})
+	}
+
+	// Marshal the slice of HolderInfo to JSON.
+	jsonOutput, err := json.MarshalIndent(holders, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("error marshalling output: %v", err)
+	}
+
+	// Save the output to a file named "<tokenAddress>.json".
+	filename := tokenAddress + ".json"
+	if err := ioutil.WriteFile(filename, jsonOutput, 0644); err != nil {
+		return "", fmt.Errorf("error writing file: %v", err)
+	}
+
+	// Read back the file content.
+	fileContent, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return "", fmt.Errorf("error reading file: %v", err)
+	}
+
+	return string(fileContent), nil
+}

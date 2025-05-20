@@ -1,0 +1,1014 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"io/ioutil"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"time"
+
+	holders "github.com/thankgod20/scraperServer/Holders"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+// ------------------ Custom Theme ------------------
+
+type darkBlueTheme struct{}
+
+var _ fyne.Theme = (*darkBlueTheme)(nil)
+
+func (d darkBlueTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameBackground:
+		return color.RGBA{R: 0x12, G: 0x12, B: 0x18, A: 0xff} // Dark background
+	case theme.ColorNameForeground:
+		return color.White // White text for contrast
+	case theme.ColorNamePrimary:
+		return color.RGBA{R: 0x64, G: 0xb5, B: 0xf6, A: 0xff} // Blue primary color
+	case theme.ColorNameHover:
+		return color.RGBA{R: 0x80, G: 0x80, B: 0x80, A: 0x60} // Slightly lighter hover
+	case theme.ColorNameInputBackground:
+		return color.RGBA{R: 0x20, G: 0x20, B: 0x28, A: 0xff} // Darker input background
+	case theme.ColorNameButton:
+		return color.RGBA{R: 0x30, G: 0x30, B: 0x38, A: 0xff} // Darker button color
+	case theme.ColorNameError:
+		return color.RGBA{R: 0xf4, G: 0x43, B: 0x36, A: 0xff} // Red error color
+	case theme.ColorNameSuccess:
+		return color.RGBA{R: 0x4c, G: 0xaf, B: 0x50, A: 0xff} // Green success color
+	case theme.ColorNameWarning:
+		return color.RGBA{R: 0xff, G: 0xc1, B: 0x07, A: 0xff} // Yellow warning color
+	case theme.ColorNameScrollBar:
+		return color.RGBA{R: 0x40, G: 0x40, B: 0x48, A: 0xff} // Dark scrollbar
+	case theme.ColorNameShadow:
+		return color.RGBA{R: 0x00, G: 0x00, B: 0x00, A: 0xa0} // Dark shadow
+	default:
+		return theme.DefaultTheme().Color(name, variant)
+	}
+}
+
+func (d darkBlueTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
+}
+
+func (d darkBlueTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(name)
+}
+
+func (d darkBlueTheme) Size(name fyne.ThemeSizeName) float32 {
+	return theme.DefaultTheme().Size(name)
+}
+
+// ------------------ Token Management ------------------
+type Transfer struct {
+	Address string
+	Amount  float64
+	Time    time.Time
+}
+type Token struct {
+	Name                  string           `json:"name"`
+	Address               string           `json:"address"`
+	Symbol                string           `json:"symbol"`
+	FDVUSD                string           `json:"fdvusd"`
+	PriceChangePercentage ChangePercentage `json:"pricechangepercentage"`
+	Transactions          Transactions     `json:"transactions"`
+	VolumeUSD             VolumeUSD        `json:"volume"`
+	Price                 string           `json:"price"`
+	MarketCap             float64          `json:"market_cap"`
+}
+type TokenMetadata struct {
+	Name   string `json:"name"`
+	Symbol string `json:"symbol"`
+	URI    string `json:"uri"`
+}
+type Address struct {
+	Address string `json:"address"`
+	Name    string `json:"name"`
+	Symbol  string `json:"symbol"`
+}
+type ApiResponse struct {
+	Data []PoolData `json:"data"`
+}
+
+type PoolData struct {
+	ID         string     `json:"id"`
+	Type       string     `json:"type"`
+	Attributes Attributes `json:"attributes"`
+}
+
+type Attributes struct {
+	BaseTokenPriceUSD     string           `json:"base_token_price_usd"`
+	QuoteTokenPriceUSD    string           `json:"quote_token_price_usd"`
+	Address               string           `json:"address"`
+	Name                  string           `json:"name"`
+	PoolCreatedAt         time.Time        `json:"pool_created_at"`
+	TokenPriceUSD         string           `json:"token_price_usd"`
+	FDVUSD                string           `json:"fdv_usd"`
+	PriceChangePercentage ChangePercentage `json:"price_change_percentage"`
+	Transactions          Transactions     `json:"transactions"`
+	VolumeUSD             VolumeUSD        `json:"volume_usd"`
+	ReserveInUSD          string           `json:"reserve_in_usd"`
+}
+
+type ChangePercentage struct {
+	M5  string `json:"m5"`
+	H1  string `json:"h1"`
+	H6  string `json:"h6"`
+	H24 string `json:"h24"`
+}
+
+type Transactions struct {
+	M5  TransactionDetails `json:"m5"`
+	M15 TransactionDetails `json:"m15"`
+	M30 TransactionDetails `json:"m30"`
+	H1  TransactionDetails `json:"h1"`
+	H24 TransactionDetails `json:"h24"`
+}
+
+type TransactionDetails struct {
+	Buys    int `json:"buys"`
+	Sells   int `json:"sells"`
+	Buyers  int `json:"buyers"`
+	Sellers int `json:"sellers"`
+}
+
+type VolumeUSD struct {
+	M5  string `json:"m5"`
+	H1  string `json:"h1"`
+	H6  string `json:"h6"`
+	H24 string `json:"h24"`
+}
+
+var tokens []Token
+
+func loadTokens(filename string) []Token {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Println("No token file found, starting fresh.")
+		return []Token{}
+	}
+	defer file.Close()
+	data, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Println("Error reading token file:", err)
+		return []Token{}
+	}
+	var tokenList []Token
+	err = json.Unmarshal(data, &tokenList)
+	if err != nil {
+		log.Println("Error unmarshalling token data:", err)
+		return []Token{}
+	}
+	return tokenList
+}
+
+func saveTokens(filename string, tokens []Token) error {
+	data, err := json.MarshalIndent(tokens, "", "  ")
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(filename, data, 0644)
+}
+
+// ------------------ OHLCV Data Structures ------------------
+
+// OHLCVEntry holds a single candlestick’s data.
+type OHLCVEntry struct {
+	Timestamp int64
+	Open      float64
+	High      float64
+	Low       float64
+	Close     float64
+	Volume    float64
+}
+
+// OhlcvResponse reflects the JSON structure from GeckoTerminal.
+type OhlcvResponse struct {
+	Data struct {
+		ID         string `json:"id"`
+		Type       string `json:"type"`
+		Attributes struct {
+			OhlcvList [][]float64 `json:"ohlcv_list"`
+		} `json:"attributes"`
+	} `json:"data"`
+	Meta struct {
+		Base struct {
+			Address         string      `json:"address"`
+			Name            string      `json:"name"`
+			Symbol          string      `json:"symbol"`
+			CoingeckoCoinID interface{} `json:"coingecko_coin_id"`
+		} `json:"base"`
+		Quote struct {
+			Address         string `json:"address"`
+			Name            string `json:"name"`
+			Symbol          string `json:"symbol"`
+			CoingeckoCoinID string `json:"coingecko_coin_id"`
+		} `json:"quote"`
+	} `json:"meta"`
+}
+
+// fetchOHLCVData gets the OHLCV data from GeckoTerminal.
+func fetchOHLCVData() ([]OHLCVEntry, error) {
+	url := "https://api.geckoterminal.com/api/v2/networks/solana/pools/5RFr1qh1sWP7nRQaBypxg3DQ2z4fpPNfXPx34qaeKXPi/ohlcv/minute?aggregate=1&limit=1000¤cy=USD"
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var ohlcvResp OhlcvResponse
+	err = json.Unmarshal(body, &ohlcvResp)
+	if err != nil {
+		return nil, err
+	}
+	var entries []OHLCVEntry
+	for _, record := range ohlcvResp.Data.Attributes.OhlcvList {
+		if len(record) < 6 {
+			continue // skip incomplete records
+		}
+		entry := OHLCVEntry{
+			Timestamp: int64(record[0]),
+			Open:      record[1],
+			High:      record[2],
+			Low:       record[3],
+			Close:     record[4],
+			Volume:    record[5],
+		}
+		entries = append(entries, entry)
+	}
+	// Reverse the entries so the oldest is first.
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+	return entries, nil
+}
+
+// ------------------ Fyne Widgets ------------------
+
+// simpleRenderer is a basic implementation of fyne.WidgetRenderer.
+type simpleRenderer struct {
+	objects []fyne.CanvasObject
+}
+
+func (r *simpleRenderer) Layout(size fyne.Size) {
+	for _, obj := range r.objects {
+		obj.Resize(size)
+	}
+}
+
+func (r *simpleRenderer) MinSize() fyne.Size {
+	var minSize fyne.Size
+	for _, obj := range r.objects {
+		minSize = minSize.Max(obj.MinSize())
+	}
+	return minSize
+}
+
+func (r *simpleRenderer) Refresh() {
+	for _, obj := range r.objects {
+		canvas.Refresh(obj)
+	}
+}
+
+func (r *simpleRenderer) BackgroundColor() color.Color {
+	return color.Transparent
+}
+
+func (r *simpleRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *simpleRenderer) Destroy() {}
+
+// chartRenderer is our custom renderer for the InteractiveOHLCVChart widget.
+// It overlays a canvas.Raster (for drawing the chart and grid) with price and time axis labels.
+type chartRenderer struct {
+	chart      *InteractiveOHLCVChart
+	raster     *canvas.Raster
+	yLabels    []*canvas.Text
+	xLabels    []*canvas.Text
+	objects    []fyne.CanvasObject
+	xTickTimes []time.Time
+}
+
+func (r *chartRenderer) Layout(size fyne.Size) {
+	r.raster.Resize(size)
+	chartH := int(0.7 * float64(size.Height))
+	numYGrid := len(r.yLabels) - 1
+	for i, label := range r.yLabels {
+		y := int(float64(chartH) * float64(i) / float64(numYGrid))
+		label.Move(fyne.NewPos(2, float32(y)-label.MinSize().Height/2))
+	}
+	numXGrid := len(r.xLabels) - 1
+	for i, label := range r.xLabels {
+		x := int(float64(size.Width) * float64(i) / float64(numXGrid))
+		label.Move(fyne.NewPos(float32(x)-label.MinSize().Width/2, float32(size.Height)-label.MinSize().Height-2))
+	}
+}
+
+func (r *chartRenderer) MinSize() fyne.Size {
+	return r.raster.MinSize()
+}
+
+func (r *chartRenderer) Refresh() {
+	size := r.raster.Size()
+	w, h := size.Width, size.Height
+	chartH := int(0.7 * float64(h))
+	if len(r.chart.data) == 0 {
+		return
+	}
+
+	n := len(r.chart.data)
+	baseCandleWidth := float64(w) / float64(n)
+	scaledCandleWidth := baseCandleWidth * r.chart.scale
+
+	// Filter only the visible candlesticks based on current offset and scale.
+	var visibleData []OHLCVEntry
+	var visibleIndices []int
+	for i, d := range r.chart.data {
+		xStart := float64(i)*scaledCandleWidth + r.chart.offsetX
+		xEnd := float64(i+1)*scaledCandleWidth + r.chart.offsetX
+		if xEnd >= 0 && xStart <= float64(w) {
+			visibleData = append(visibleData, d)
+			visibleIndices = append(visibleIndices, i)
+		}
+	}
+
+	// If there is no visible data, do nothing.
+	if len(visibleData) == 0 {
+		return
+	}
+
+	// Recalculate the visible price range.
+	minPrice := visibleData[0].Low
+	maxPrice := visibleData[0].High
+	for _, d := range visibleData {
+		if d.Low < minPrice {
+			minPrice = d.Low
+		}
+		if d.High > maxPrice {
+			maxPrice = d.High
+		}
+	}
+	priceRange := maxPrice - minPrice
+	minRange := 0.00001 // Adjust threshold based on asset's scale.
+	if priceRange < minRange {
+		midPrice := (minPrice + maxPrice) / 2.0
+		minPrice = midPrice - minRange/2.0
+		maxPrice = midPrice + minRange/2.0
+		priceRange = minRange
+	}
+
+	// Update Y-axis labels based on the visible price range.
+	numYGrid := len(r.yLabels) - 1
+	for i, label := range r.yLabels {
+		// Compute the price corresponding to this grid line.
+		priceValue := maxPrice - (float64(i)/float64(numYGrid))*priceRange
+		label.Text = fmt.Sprintf("%.6f", priceValue)
+
+		// Compute the base y position along the chart area.
+		baseY := float64(chartH) * (float64(i) / float64(numYGrid))
+		// Apply vertical zoom and pan adjustments:
+		yPos := int(baseY*r.chart.scaleY + r.chart.offsetY)
+		label.Move(fyne.NewPos(2, float32(yPos)-label.MinSize().Height/2))
+		label.Refresh()
+	}
+
+	// --- X-axis: Update label positions only, using fixed tick times ---
+	// If the fixed tick times haven't been computed yet, do so.
+	if r.xTickTimes == nil || len(r.xTickTimes) == 0 {
+		startTime := time.Unix(r.chart.data[0].Timestamp, 0)
+		endTime := time.Unix(r.chart.data[len(r.chart.data)-1].Timestamp, 0)
+		totalDuration := endTime.Sub(startTime)
+		numXGrid := len(r.xLabels) - 1
+
+		r.xTickTimes = make([]time.Time, numXGrid+1)
+		for i := 0; i <= numXGrid; i++ {
+			ratio := float64(i) / float64(numXGrid)
+			r.xTickTimes[i] = startTime.Add(time.Duration(ratio * float64(totalDuration)))
+			// Set fixed text (only once).
+			r.xLabels[i].Text = r.xTickTimes[i].Format("15:04")
+		}
+	}
+
+	// Compute the total data width (in pixels) for the full data range.
+	totalDataWidth := float64(len(r.chart.data)) * scaledCandleWidth
+	// Compute full time range (for mapping tick times to x positions).
+	fullStartTime := time.Unix(r.chart.data[0].Timestamp, 0)
+	fullEndTime := time.Unix(r.chart.data[len(r.chart.data)-1].Timestamp, 0)
+	totalDuration := fullEndTime.Sub(fullStartTime)
+
+	// Update x-axis label positions based on fixed tick times and current pan/zoom.
+	for i, label := range r.xLabels {
+		tickTime := r.xTickTimes[i]
+		// Compute the ratio of this tick time within the full time range.
+		ratio := float64(tickTime.Sub(fullStartTime)) / float64(totalDuration)
+		// Map to a data-space x position and apply horizontal offset.
+		xPos := ratio*totalDataWidth + r.chart.offsetX
+		label.Move(fyne.NewPos(float32(xPos)-label.MinSize().Width/2, float32(h)-label.MinSize().Height-2))
+		label.Refresh()
+	}
+
+	r.raster.Refresh()
+}
+
+func (r *chartRenderer) BackgroundColor() color.Color {
+	return color.Transparent
+}
+
+func (r *chartRenderer) Objects() []fyne.CanvasObject {
+	return r.objects
+}
+
+func (r *chartRenderer) Destroy() {}
+
+// InteractiveOHLCVChart is a custom widget that draws an interactive candlestick chart with volume plot.
+
+type InteractiveOHLCVChart struct {
+	widget.BaseWidget
+	data        []OHLCVEntry
+	offsetX     float64 // horizontal pan offset
+	scale       float64 // horizontal zoom scale factor
+	offsetY     float64 // vertical pan offset
+	scaleY      float64 // vertical zoom scale factor
+	prevDragPos fyne.Position
+	dragging    bool
+}
+
+func NewInteractiveOHLCVChart(data []OHLCVEntry) *InteractiveOHLCVChart {
+	c := &InteractiveOHLCVChart{
+		data:    data,
+		offsetX: 0,
+		scale:   1.0,
+		offsetY: 0,
+		scaleY:  1.0,
+	}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *InteractiveOHLCVChart) CreateRenderer() fyne.WidgetRenderer {
+	// Define number of grid lines for each axis.
+	numYGrid := 5
+	numXGrid := 5
+
+	// Create label objects for the price (y) and time (x) axes.
+	yLabels := make([]*canvas.Text, numYGrid+1)
+	for i := 0; i <= numYGrid; i++ {
+		lbl := canvas.NewText("", color.White)
+		lbl.TextSize = 10
+		yLabels[i] = lbl
+	}
+	xLabels := make([]*canvas.Text, numXGrid+1)
+	for i := 0; i <= numXGrid; i++ {
+		lbl := canvas.NewText("", color.White)
+		lbl.TextSize = 10
+		xLabels[i] = lbl
+	}
+
+	// Create a raster that draws the chart (candlesticks, volume bars) along with grid lines.
+	raster := canvas.NewRaster(func(w, h int) image.Image {
+		img := image.NewRGBA(image.Rect(0, 0, w, h))
+		// Fill background.
+		bgColor := darkBlueTheme{}.Color(theme.ColorNameBackground, theme.VariantDark)
+		for x := 0; x < w; x++ {
+			for y := 0; y < h; y++ {
+				img.Set(x, y, bgColor)
+			}
+		}
+		// Divide drawing area into candlestick chart (top 70%) and volume plot (bottom 30%).
+		chartH := int(0.7 * float64(h))
+		volumeH := h - chartH
+
+		// Determine price range.
+		if len(c.data) == 0 {
+			return img
+		}
+		minPrice := c.data[0].Low
+		maxPrice := c.data[0].High
+		for _, d := range c.data {
+			if d.Low < minPrice {
+				minPrice = d.Low
+			}
+			if d.High > maxPrice {
+				maxPrice = d.High
+			}
+		}
+		priceRange := maxPrice - minPrice
+		if priceRange == 0 {
+			priceRange = 1
+		}
+		// Determine time range.
+		//startTime := time.Unix(c.data[0].Timestamp, 0)
+		//endTime := time.Unix(c.data[len(c.data)-1].Timestamp, 0)
+
+		// Draw grid lines.
+		gridColor := color.RGBA{R: 64, G: 64, B: 64, A: 255}
+		// Horizontal grid for price axis in chart area.
+		for i := 0; i <= numYGrid; i++ {
+			y := int(float64(chartH) * float64(i) / float64(numYGrid))
+			for x := 0; x < w; x++ {
+				img.Set(x, y, gridColor)
+			}
+		}
+		// Vertical grid for time axis (over entire widget height).
+		for i := 0; i <= numXGrid; i++ {
+			x := int(float64(w) * float64(i) / float64(numXGrid))
+			for y := 0; y < h; y++ {
+				img.Set(x, y, gridColor)
+			}
+		}
+
+		// Draw candlesticks and volume bars.
+		n := len(c.data)
+		baseCandleWidth := float64(w) / float64(n)
+		scaledCandleWidth := baseCandleWidth * c.scale
+		for i, d := range c.data {
+			// Apply horizontal pan and zoom.
+			xStart := int(float64(i)*scaledCandleWidth + c.offsetX)
+			xEnd := int(float64(i+1)*scaledCandleWidth + c.offsetX)
+			xCenter := (xStart + xEnd) / 2
+			if xEnd < 0 || xStart > w {
+				continue
+			}
+			/*scalePrice := func(price float64) int {
+				return int(float64(chartH) - ((price - minPrice) / priceRange * float64(chartH)))
+			}*/
+			// scalePrice converts a price to a y coordinate using the visible min and max prices,
+			// the chart height, and applies vertical zoom and pan adjustments.
+			scalePrice := func(price, minPrice, maxPrice float64, chartH int, offsetY, scaleY float64) int {
+				priceRange := maxPrice - minPrice
+				if priceRange == 0 {
+					priceRange = 1
+				}
+				// Normalize so that higher prices get a lower pixel value (0 at top)
+				normalized := (price - minPrice) / priceRange
+				y := float64(chartH) * (1.0 - normalized)
+				// Apply vertical zoom and pan adjustments:
+				y = y*scaleY + offsetY
+				return int(y)
+			}
+			openY := scalePrice(d.Open, minPrice, maxPrice, chartH, c.offsetY, c.scaleY)
+			closeY := scalePrice(d.Close, minPrice, maxPrice, chartH, c.offsetY, c.scaleY)
+			highY := scalePrice(d.High, minPrice, maxPrice, chartH, c.offsetY, c.scaleY)
+			lowY := scalePrice(d.Low, minPrice, maxPrice, chartH, c.offsetY, c.scaleY)
+
+			//openY := scalePrice(d.Open)
+			//closeY := scalePrice(d.Close)
+			//highY := scalePrice(d.High)
+			//lowY := scalePrice(d.Low)
+			// Draw wick.
+			//xCenter := (xStart + xEnd) / 2
+			wickColor := color.White
+			for y := highY; y <= lowY; y++ {
+				if xCenter >= 0 && xCenter < w && y >= 0 && y < chartH {
+					img.Set(xCenter, y, wickColor)
+				}
+			}
+			// Determine candle body color.
+			var bodyColor color.Color
+			if d.Close >= d.Open {
+				bodyColor = color.RGBA{0, 200, 0, 255}
+			} else {
+				bodyColor = color.RGBA{200, 0, 0, 255}
+			} /*
+				top, bottom := openY, closeY
+				if d.Close < d.Open {
+					top, bottom = closeY, openY
+				}*/
+			// Calculate raw body height.
+			rawBodyHeight := math.Abs(float64(closeY - openY))
+			minBodyHeight := 2.0 // Minimum body height in pixels
+
+			var top, bottom int
+			if rawBodyHeight < minBodyHeight {
+				// Force a minimum height.
+				if d.Close >= d.Open {
+					// Bullish candle: close is higher (i.e. lower pixel value)
+					// We'll set top = openY - minBodyHeight (ensuring top is above openY)
+					top = openY - int(minBodyHeight)
+					bottom = openY
+				} else {
+					// Bearish candle: close is lower (i.e. higher pixel value)
+					top = openY
+					bottom = openY + int(minBodyHeight)
+				}
+			} else {
+				// Normal case: use calculated values.
+				if d.Close >= d.Open {
+					top = closeY
+					bottom = openY
+				} else {
+					top = openY
+					bottom = closeY
+				}
+			}
+
+			for x := xStart; x < xEnd; x++ {
+				for y := top; y <= bottom; y++ {
+					if x >= 0 && x < w && y >= 0 && y < chartH {
+						img.Set(x, y, bodyColor)
+					}
+				}
+			}
+			// Draw volume bar in the volume plot region.
+			// First, find maximum volume (for scaling).
+			maxVolume := 0.0
+			for _, d2 := range c.data {
+				if d2.Volume > maxVolume {
+					maxVolume = d2.Volume
+				}
+			}
+			if maxVolume == 0 {
+				maxVolume = 1
+			}
+			volBarHeight := int((d.Volume / maxVolume) * float64(volumeH))
+			volXStart := xStart
+			volXEnd := xEnd
+			volYStart := chartH + (volumeH - volBarHeight)
+			for x := volXStart; x < volXEnd; x++ {
+				for y := volYStart; y < chartH+volumeH; y++ {
+					img.Set(x, y, color.RGBA{0x80, 0xa0, 0xc0, 0x90})
+				}
+			}
+		}
+		return img
+	})
+
+	objects := []fyne.CanvasObject{raster}
+	// Add the axis labels to the renderer objects.
+	for _, lbl := range yLabels {
+		objects = append(objects, lbl)
+	}
+	for _, lbl := range xLabels {
+		objects = append(objects, lbl)
+	}
+	return &chartRenderer{
+		chart:   c,
+		raster:  raster,
+		yLabels: yLabels,
+		xLabels: xLabels,
+		objects: objects,
+	}
+}
+
+// Implement Draggable and Scrollable interfaces for interactivity.
+
+func (c *InteractiveOHLCVChart) Dragged(e *fyne.DragEvent) {
+	if !c.dragging {
+		c.prevDragPos = e.Position
+		c.dragging = true
+	}
+	delta := e.Position.Subtract(c.prevDragPos)
+	c.offsetX += float64(delta.X)
+	c.offsetY += float64(delta.Y)
+	c.prevDragPos = e.Position
+	c.Refresh()
+}
+
+func (c *InteractiveOHLCVChart) DragEnd() {
+	c.dragging = false
+}
+
+func (c *InteractiveOHLCVChart) Scrolled(e *fyne.ScrollEvent) {
+	if e.Scrolled.DY > 0 {
+		c.scale *= 1.1
+		c.scaleY *= 1.1
+	} else {
+		c.scale /= 1.1
+		c.scaleY /= 1.1
+	}
+	c.Refresh()
+}
+
+// ------------------ MiniChart Widget ------------------
+
+type MiniChart struct {
+	widget.BaseWidget
+	title string
+}
+
+func NewMiniChart(title string) *MiniChart {
+	m := &MiniChart{title: title}
+	m.ExtendBaseWidget(m)
+	return m
+}
+
+func (m *MiniChart) CreateRenderer() fyne.WidgetRenderer {
+	txt := canvas.NewText(m.title, color.White)
+	txt.Alignment = fyne.TextAlignCenter
+	return &simpleRenderer{objects: []fyne.CanvasObject{txt}}
+}
+
+func (m *MiniChart) Tapped(ev *fyne.PointEvent) {
+	expanded := NewMiniChart("Expanded: " + m.title)
+	win := fyne.CurrentApp().NewWindow("Expanded Chart")
+	win.SetContent(expanded)
+	win.Resize(fyne.NewSize(800, 600))
+	win.Show()
+}
+
+func (m *MiniChart) TappedSecondary(ev *fyne.PointEvent) {
+	// No secondary action.
+}
+
+func getTokenMetadata(token string) *TokenMetadata {
+	url := fmt.Sprintf("http://localhost:3300/api/token-metadata?mint=%s", token)
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Println("Error fetching data:", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			fmt.Println("Error reading response body:", err)
+			return nil
+		}
+		var metadata TokenMetadata
+		if err := json.Unmarshal(body, &metadata); err != nil {
+			fmt.Println("Error unmarshaling JSON:", err)
+			return nil
+		}
+		fmt.Printf("Name: %s\nSymbol: %s\nURI: %s\n", metadata.Name, metadata.Symbol, metadata.URI)
+		return &metadata
+	} else {
+		fmt.Printf("Failed to fetch data. Status code: %d\n", resp.StatusCode)
+		return nil
+	}
+}
+
+func fetchPoolData(address string) (*ApiResponse, error) {
+	url := fmt.Sprintf("https://api.geckoterminal.com/api/v2/networks/solana/tokens/%s/pools", address)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("error making GET request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("received non-200 response code: %d", resp.StatusCode)
+	}
+	var apiResponse ApiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+		return nil, fmt.Errorf("error decoding JSON response: %v", err)
+	}
+	return &apiResponse, nil
+}
+func startLivePriceUpdates(chart *InteractiveOHLCVChart) {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for range ticker.C {
+			latestEntry, err := fetchLatestOHLCVEntry()
+			if err != nil {
+				log.Println("Error fetching live update:", err)
+				continue
+			}
+			// Update current candle if still within the same minute, else append.
+			if len(chart.data) > 0 {
+				lastIdx := len(chart.data) - 1
+				lastCandleTime := time.Unix(chart.data[lastIdx].Timestamp, 0)
+				latestTime := time.Unix(latestEntry.Timestamp, 0)
+				if lastCandleTime.Minute() == latestTime.Minute() {
+					// Update the last candle.
+					chart.data[lastIdx].Close = latestEntry.Close
+					if latestEntry.High > chart.data[lastIdx].High {
+						chart.data[lastIdx].High = latestEntry.High
+					}
+					if latestEntry.Low < chart.data[lastIdx].Low {
+						chart.data[lastIdx].Low = latestEntry.Low
+					}
+					chart.data[lastIdx].Volume += latestEntry.Volume
+				} else {
+					// Append new candle.
+					chart.data = append(chart.data, *latestEntry)
+				}
+			} else {
+				chart.data = append(chart.data, *latestEntry)
+			}
+			// Optionally, trim the slice if it exceeds a maximum length.
+			if len(chart.data) > 1000 {
+				chart.data = chart.data[1:]
+			}
+			// Refresh the chart (this is safe since Fyne’s Refresh is thread-safe).
+			chart.Refresh()
+		}
+	}()
+}
+
+// fetchLatestOHLCVEntry gets only the latest candlestick entry.
+func fetchLatestOHLCVEntry() (*OHLCVEntry, error) {
+	url := "https://api.geckoterminal.com/api/v2/networks/solana/pools/5RFr1qh1sWP7nRQaBypxg3DQ2z4fpPNfXPx34qaeKXPi/ohlcv/minute?aggregate=1&limit=1¤cy=USD"
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var ohlcvResp OhlcvResponse
+	if err := json.Unmarshal(body, &ohlcvResp); err != nil {
+		return nil, err
+	}
+	if len(ohlcvResp.Data.Attributes.OhlcvList) == 0 {
+		return nil, fmt.Errorf("no data")
+	}
+	record := ohlcvResp.Data.Attributes.OhlcvList[0]
+	if len(record) < 6 {
+		return nil, fmt.Errorf("incomplete data")
+	}
+	entry := &OHLCVEntry{
+		Timestamp: int64(record[0]),
+		Open:      record[1],
+		High:      record[2],
+		Low:       record[3],
+		Close:     record[4],
+		Volume:    record[5],
+	}
+	return entry, nil
+}
+
+// ------------------ Main UI ------------------
+
+func main() {
+	a := app.New()
+	a.Settings().SetTheme(darkBlueTheme{})
+
+	w := a.NewWindow("Meme Coin OHLCV Chart UI")
+	w.Resize(fyne.NewSize(1200, 800))
+
+	// Load tokens.
+	tokens = loadTokens("tokens.json")
+
+	// Fetch OHLCV data.
+	ohlcvData, err := fetchOHLCVData()
+	if err != nil {
+		log.Println("Error fetching OHLCV data:", err)
+		ohlcvData = []OHLCVEntry{}
+	}
+	tokenAddress := "Bd4rFeLi5Ct7Lm5GaV3Nxzguid3RA2k6KtWL8W1Apump"
+
+	// Create a new BitqueryClient.
+	client := holders.NewBitqueryClient()
+
+	// Fetch transfer data, update the JSON file, and get its content.
+	output, err := client.UpdateAndGetTransfers(tokenAddress)
+	if err != nil {
+		log.Fatalf("Error updating and getting transfers: %v", err)
+	}
+	fmt.Println("Output --", output)
+	// Create the interactive chart.
+	mainChart := NewInteractiveOHLCVChart(ohlcvData)
+	startLivePriceUpdates(mainChart)
+
+	// --- Create Control Buttons for Pan/Zoom ---
+	resetViewButton := widget.NewButton("Reset View", func() {
+		// Reset pan and zoom to default.
+		mainChart.offsetX = 0
+		mainChart.offsetY = 0
+		mainChart.scale = 1.0
+		mainChart.scaleY = 1.0
+		mainChart.Refresh()
+	})
+	zoomInButton := widget.NewButton("Zoom(+)", func() {
+		mainChart.scale *= 1.1
+		mainChart.scaleY *= 1.1
+		mainChart.Refresh()
+	})
+	zoomOutButton := widget.NewButton("Zoom(-)", func() {
+		mainChart.scale /= 1.1
+		mainChart.scaleY /= 1.1
+		mainChart.Refresh()
+	})
+	// Place the buttons in a horizontal container.
+	chartControls := container.NewHBox(resetViewButton, zoomOutButton, zoomInButton)
+
+	// Create mini charts.
+	miniChart1 := NewMiniChart("Mini Chart 1")
+	miniChart2 := NewMiniChart("Mini Chart 2")
+	miniChart3 := NewMiniChart("Mini Chart 3")
+	miniChartsContainer := container.NewHBox(miniChart1, miniChart2, miniChart3)
+
+	// Left panel: include the control buttons above the main chart.
+	leftPanel := container.NewBorder(chartControls, miniChartsContainer, nil, nil, mainChart)
+
+	// Token management panel remains as before.
+	var tokenList *widget.List
+	tokenEntry := widget.NewEntry()
+	tokenEntry.SetPlaceHolder("Enter token name")
+	addTokenButton := widget.NewButton("Add Token", func() {
+		if tokenEntry.Text != "" {
+			metaData := getTokenMetadata(tokenEntry.Text)
+			data, err := fetchPoolData(tokenEntry.Text)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return
+			}
+			if len(data.Data) == 0 {
+				return
+			}
+			info := len(data.Data)
+			latestData := data.Data[info-1]
+			newToken := Token{
+				Name:                  metaData.Name,
+				Symbol:                metaData.Symbol,
+				Address:               latestData.ID,
+				FDVUSD:                latestData.Attributes.FDVUSD,
+				PriceChangePercentage: latestData.Attributes.PriceChangePercentage,
+				Transactions:          latestData.Attributes.Transactions,
+				VolumeUSD:             latestData.Attributes.VolumeUSD,
+				Price:                 latestData.Attributes.TokenPriceUSD,
+				MarketCap:             0.0, // Update if available.
+			}
+			tokens = append(tokens, newToken)
+			if err := saveTokens("tokens.json", tokens); err != nil {
+				dialog.ShowError(err, w)
+			}
+			tokenList.Refresh()
+			tokenEntry.SetText("")
+		}
+	})
+	tokenList = widget.NewList(
+		func() int { return len(tokens) },
+		func() fyne.CanvasObject { return widget.NewLabel("template") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			o.(*widget.Label).SetText(tokens[i].Name)
+		},
+	)
+	tokenInfo := widget.NewLabel("Select a token to view details.")
+	tokenInfo.Wrapping = fyne.TextWrapWord
+
+	tokenList.OnSelected = func(id widget.ListItemID) {
+		selected := tokens[id]
+		tokenInfo.SetText(fmt.Sprintf(
+			"Name: %s\n\nSymbol: %s\n\nAddress: %s\n\nPrice: %s\n\nFDV (USD): %s\n\nPrice Change (5m): %s%% | (1h): %s%% | (6h): %s%% | (24h): %s%% |\n\nTransactions (5m): Buys: %d, Sells: %d, Buyers: %d, Sellers: %d\n\nTransactions (15m): Buys: %d, Sells: %d, Buyers: %d, Sellers: %d\n\nTransactions (30m): Buys: %d, Sells: %d, Buyers: %d, Sellers: %d\n\nTransactions (1h): Buys: %d, Sells: %d, Buyers: %d, Sellers: %d\n\nTransactions (24h): Buys: %d, Sells: %d, Buyers: %d, Sellers: %d\n\nVolume (5m): %s\n\nMarket Cap: %.2f",
+			selected.Name,
+			selected.Symbol,
+			selected.Address,
+			selected.Price,
+			selected.FDVUSD,
+			selected.PriceChangePercentage.M5,
+			selected.PriceChangePercentage.H1,
+			selected.PriceChangePercentage.H6,
+			selected.PriceChangePercentage.H24,
+			selected.Transactions.M5.Buys,
+			selected.Transactions.M5.Sells,
+			selected.Transactions.M5.Buyers,
+			selected.Transactions.M5.Sellers,
+			selected.Transactions.M15.Buys,
+			selected.Transactions.M15.Sells,
+			selected.Transactions.M15.Buyers,
+			selected.Transactions.M15.Sellers,
+			selected.Transactions.M30.Buys,
+			selected.Transactions.M30.Sells,
+			selected.Transactions.M30.Buyers,
+			selected.Transactions.M30.Sellers,
+			selected.Transactions.H1.Buys,
+			selected.Transactions.H1.Sells,
+			selected.Transactions.H1.Buyers,
+			selected.Transactions.H1.Sellers,
+			selected.Transactions.H24.Buys,
+			selected.Transactions.H24.Sells,
+			selected.Transactions.H24.Buyers,
+			selected.Transactions.H24.Sellers,
+			selected.VolumeUSD.M5,
+			selected.MarketCap,
+		))
+	}
+
+	rightPanel := container.NewVBox(
+		widget.NewLabel("Add Token"),
+		tokenEntry,
+		addTokenButton,
+		widget.NewSeparator(),
+		widget.NewLabel("Tokens"),
+		tokenList,
+		widget.NewSeparator(),
+		widget.NewLabel("Token Information"),
+		tokenInfo,
+	)
+
+	// Main layout: charts on left, token management on right.
+	content := container.NewHSplit(leftPanel, rightPanel)
+	content.SetOffset(0.75)
+
+	w.SetContent(content)
+	w.ShowAndRun()
+}

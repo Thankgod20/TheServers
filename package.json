@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "axios": "^1.7.9",
+    "chart.js": "^4.4.8",
+    "chartjs-plugin-annotation": "^3.1.0",
+    "d3": "^7.9.0",
+    "lightweight-charts": "^4.2.2",
+    "react-chartjs-2": "^5.3.0",
+    "recharts": "^2.15.2"
+  },
+  "devDependencies": {
+    "@types/d3": "^7.4.3"
+  }
+}
