@@ -1,0 +1,506 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-redis/redis"
+	"golang.org/x/sync/singleflight" // Import the singleflight package
+)
+
+const (
+	srsCacheTTL                = 5 * time.Minute
+	defaultSrsPage             = 1
+	defaultSrsLimit            = 10
+	holderHistoryRedisPrefix   = "holderhistory:"
+	whaleThreshold             = 10_000_000.0
+	defaultIntervalMinutesProc = 1
+)
+
+// ----- Type Definitions (Unchanged) -----
+
+type HoldingsMap map[string]float64
+type CountsMap map[string]int
+
+type CategoryHoldings struct {
+	Whales HoldingsMap `json:"whales"`
+	Retail HoldingsMap `json:"retail"`
+	Lps    HoldingsMap `json:"lps"`
+}
+
+type CategoryHolderCounts struct {
+	Whales CountsMap `json:"whales"`
+	Retail CountsMap `json:"retail"`
+	Lps    CountsMap `json:"lps"`
+}
+
+type HolderHistoryEntry struct {
+	Address string    `json:"address"`
+	Amount  []float64 `json:"amount"`
+	Time    []string  `json:"time"`
+}
+
+type ComputedDataType struct {
+	ProcessedHoldings     CategoryHoldings     `json:"procssholding"`
+	ProcessedHolderCounts CategoryHolderCounts `json:"procssholdingcount"`
+}
+
+type PaginatedSrsResponse struct {
+	ProcessedHoldings     CategoryHoldings     `json:"procssholding"`
+	ProcessedHolderCounts CategoryHolderCounts `json:"procssholdingcount"`
+	Page                  int                  `json:"page"`
+	TotalPages            int                  `json:"totalPages"`
+	TotalItems            int                  `json:"totalItems"`
+}
+
+// ----- Service Definition (Refactored) -----
+
+// SrsService handles the logic and now includes singleflight for concurrency safety.
+type SrsService struct {
+	redisClient *redis.Client
+	sfGroup     singleflight.Group
+}
+
+// NewSrsService creates a new SrsService.
+func NewSrsService(redisClient *redis.Client) *SrsService {
+	return &SrsService{
+		redisClient: redisClient,
+		// sfGroup is zero-value ready
+	}
+}
+
+// ----- Helper and Core Logic Functions (Unchanged) -----
+// These functions are already memory-efficient for a single execution.
+
+func getSrsCacheKey(address string, lps []string) string {
+	lpsKey := ""
+	if len(lps) > 0 {
+		sortedLps := make([]string, len(lps))
+		copy(sortedLps, lps)
+		sort.Strings(sortedLps)
+		lpsKey = strings.Join(sortedLps, ",")
+	}
+	return fmt.Sprintf("%s|%s", address, lpsKey)
+}
+
+func roundTimeToInterval(isoTimeStr string, intervalMinutes int) (string, error) {
+	parsedTime, err := time.Parse(time.RFC3339Nano, isoTimeStr)
+	if err != nil {
+		parsedTime, err = time.Parse(time.RFC3339, isoTimeStr)
+		if err != nil {
+			return "", err
+		}
+	}
+	currentMinutes := parsedTime.Minute()
+	roundedMinutes := (currentMinutes / intervalMinutes) * intervalMinutes
+	finalRoundedTime := time.Date(
+		parsedTime.Year(), parsedTime.Month(), parsedTime.Day(),
+		parsedTime.Hour(), roundedMinutes, 0, 0, parsedTime.Location(),
+	)
+	return finalRoundedTime.Format(time.RFC3339), nil
+}
+
+func streamAndComputeAggregates(jsonData io.Reader, lpsFilter []string, intervalMinutes int) (*ComputedDataType, error) {
+	rawTimeSeries, addressMax := make(map[string]map[string]float64), make(map[string]float64)
+	decoder := json.NewDecoder(jsonData)
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // [
+
+	for decoder.More() {
+		var holder HolderHistoryEntry
+		if err := decoder.Decode(&holder); err != nil {
+			return nil, fmt.Errorf("decoding error: %w", err)
+		}
+		currentAddressMax := addressMax[holder.Address]
+		for i, ts := range holder.Time {
+			roundedTimeStr, err := roundTimeToInterval(ts, intervalMinutes)
+			if err != nil {
+				continue
+			}
+			amount := holder.Amount[i]
+			if _, ok := rawTimeSeries[roundedTimeStr]; !ok {
+				rawTimeSeries[roundedTimeStr] = make(map[string]float64)
+			}
+			rawTimeSeries[roundedTimeStr][holder.Address] = amount
+			if amount > currentAddressMax {
+				currentAddressMax = amount
+			}
+		}
+		addressMax[holder.Address] = currentAddressMax
+	}
+
+	lpSet, whales, retail, lpsActual := make(map[string]bool), make(map[string]bool), make(map[string]bool), make(map[string]bool)
+	for _, lpAddr := range lpsFilter {
+		lpSet[lpAddr] = true
+	}
+	for addr, maxAmt := range addressMax {
+		if lpSet[addr] {
+			lpsActual[addr] = true
+		} else if maxAmt >= whaleThreshold {
+			whales[addr] = true
+		} else {
+			retail[addr] = true
+		}
+	}
+
+	allTimestamps := make([]string, 0, len(rawTimeSeries))
+	for ts := range rawTimeSeries {
+		allTimestamps = append(allTimestamps, ts)
+	}
+	sort.Strings(allTimestamps)
+
+	holdingsResult := CategoryHoldings{Whales: HoldingsMap{}, Retail: HoldingsMap{}, Lps: HoldingsMap{}}
+	countsResult := CategoryHolderCounts{Whales: CountsMap{}, Retail: CountsMap{}, Lps: CountsMap{}}
+	for _, t := range allTimestamps {
+		snap := rawTimeSeries[t]
+		holdingsResult.Whales[t], holdingsResult.Retail[t], holdingsResult.Lps[t] = 0.0, 0.0, 0.0
+		countsResult.Whales[t], countsResult.Retail[t], countsResult.Lps[t] = 0, 0, 0
+		for addr, amt := range snap {
+			if whales[addr] {
+				holdingsResult.Whales[t] += amt
+				countsResult.Whales[t]++
+			} else if retail[addr] {
+				holdingsResult.Retail[t] += amt
+				countsResult.Retail[t]++
+			} else if lpsActual[addr] {
+				holdingsResult.Lps[t] += amt
+				countsResult.Lps[t]++
+			}
+		}
+	}
+	return &ComputedDataType{ProcessedHoldings: holdingsResult, ProcessedHolderCounts: countsResult}, nil
+}
+
+func (s *SrsService) fetchHolderHistoryReader(ctx context.Context, address string) (io.Reader, error) {
+	redisKey := fmt.Sprintf("%s%s", holderHistoryRedisPrefix, address)
+	jsonDataStr, err := s.redisClient.Get(redisKey).Result()
+	if err == redis.Nil {
+		return strings.NewReader(`{"holders":[]}`), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("redis get error: %w", err)
+	}
+
+	jsonData, err := decompress([]byte(jsonDataStr))
+	if err != nil {
+		return nil, fmt.Errorf("decompress error: %w", err)
+	}
+	if bytes.HasPrefix(jsonData, []byte(`[`)) {
+		var wrappedData bytes.Buffer
+		wrappedData.WriteString(`{"holders":`)
+		wrappedData.Write(jsonData)
+		wrappedData.WriteString(`}`)
+		return &wrappedData, nil
+	}
+	return bytes.NewReader(jsonData), nil
+}
+
+func (s *SrsService) computeSrsData(ctx context.Context, address string, lps []string) (*ComputedDataType, error) {
+	historyReader, err := s.fetchHolderHistoryReader(ctx, address)
+	if err != nil {
+		return nil, fmt.Errorf("fetch reader error: %w", err)
+	}
+	return streamAndComputeAggregates(historyReader, lps, defaultIntervalMinutesProc)
+}
+
+// ----- Concurrency-Safe HTTP Handler and Caching -----
+
+// Helper struct for singleflight results
+type srsComputationResult struct {
+	dataBytes []byte
+}
+
+func (s *SrsService) triggerSrsBackgroundRefresh(ctx context.Context, cacheKey, address, redisStoreKey string, lps []string) {
+	go func() {
+		// Use singleflight to prevent multiple background refreshes from piling up.
+		s.sfGroup.Do(redisStoreKey+"_refresh", func() (interface{}, error) {
+			log.Printf("Triggering SRS background refresh for %s", redisStoreKey)
+			bgCtx := context.Background()
+			data, err := s.computeSrsData(bgCtx, address, lps)
+			if err != nil {
+				log.Printf("Error during SRS background refresh for %s: %v", redisStoreKey, err)
+				return nil, err
+			}
+			jsonData, _ := json.Marshal(data)
+			compressedData, _ := compress(jsonData)
+			s.redisClient.Set(redisStoreKey, compressedData, srsCacheTTL)
+			log.Printf("SRS cache refreshed in background for %s", redisStoreKey)
+			return nil, nil
+		})
+	}()
+}
+
+// HandleSrsRequest is the concurrency-safe HTTP handler.
+func (s *SrsService) HandleSrsRequest(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parameter Parsing
+	address := r.URL.Query().Get("address")
+	if address == "" {
+		http.Error(w, `{"error": "Missing address"}`, http.StatusBadRequest)
+		return
+	}
+	lpsParam := r.URL.Query().Get("lps")
+	var lps []string
+	if lpsParam != "" {
+		lps = strings.Split(lpsParam, ",")
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = defaultSrsPage
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = defaultSrsLimit
+	}
+
+	paramCacheKey := getSrsCacheKey(address, lps)
+	redisStoreKey := fmt.Sprintf("srs:%s", paramCacheKey)
+	log.Printf("New SRS request - redis key: %s", redisStoreKey)
+
+	// Step 1: Check Cache
+	cacheEntryStr, redisErr := s.redisClient.Get(redisStoreKey).Result()
+	if redisErr == nil {
+		log.Println("SRS serving stale cache and refreshing in background for", redisStoreKey)
+		s.triggerSrsBackgroundRefresh(ctx, paramCacheKey, address, redisStoreKey, lps)
+		cacheEntry, err := decompress([]byte(cacheEntryStr))
+		if err == nil {
+			var data ComputedDataType
+			if json.Unmarshal(cacheEntry, &data) == nil {
+				result := paginateSrsData(&data, page, limit)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(result)
+				return
+			}
+		}
+	} else if redisErr != redis.Nil {
+		log.Printf("Redis error (non-Nil) for SRS key %s: %v", redisStoreKey, redisErr)
+	}
+
+	// Step 2: Cache Miss - Use singleflight to compute safely
+	log.Printf("SRS cache miss for %s. Using singleflight to compute.", redisStoreKey)
+	v, err, _ := s.sfGroup.Do(redisStoreKey, func() (interface{}, error) {
+		log.Printf("Executing expensive SRS computation for %s", redisStoreKey)
+		computedData, err := s.computeSrsData(ctx, address, lps)
+		if err != nil {
+			return nil, err
+		}
+		dataJSON, err := json.Marshal(computedData)
+		if err != nil {
+			return nil, err
+		}
+		compressedData, err := compress(dataJSON)
+		if err == nil {
+			s.redisClient.Set(redisStoreKey, compressedData, srsCacheTTL)
+		}
+		return &srsComputationResult{dataBytes: dataJSON}, nil
+	})
+	s.sfGroup.Forget(redisStoreKey)
+
+	if err != nil {
+		log.Printf("Error during singleflight SRS computation for %s: %v", redisStoreKey, err)
+		http.Error(w, `{"error": "Internal Server Error during data computation"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Step 3: Process the result from singleflight
+	resultData := v.(*srsComputationResult)
+	var data ComputedDataType
+	if err := json.Unmarshal(resultData.dataBytes, &data); err != nil {
+		log.Printf("Error unmarshalling result from singleflight for %s: %v", redisStoreKey, err)
+		http.Error(w, `{"error": "Internal Server Error after computation"}`, http.StatusInternalServerError)
+		return
+	}
+
+	result := paginateSrsData(&data, page, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// ----- Pagination (Unchanged) -----
+
+func filterCategoryHoldingsByTimes(data CategoryHoldings, timesSet map[string]bool) CategoryHoldings {
+	filtered := CategoryHoldings{Whales: HoldingsMap{}, Retail: HoldingsMap{}, Lps: HoldingsMap{}}
+	for t, v := range data.Whales {
+		if timesSet[t] {
+			filtered.Whales[t] = v
+		}
+	}
+	for t, v := range data.Retail {
+		if timesSet[t] {
+			filtered.Retail[t] = v
+		}
+	}
+	for t, v := range data.Lps {
+		if timesSet[t] {
+			filtered.Lps[t] = v
+		}
+	}
+	return filtered
+}
+
+func filterCategoryHolderCountsByTimes(data CategoryHolderCounts, timesSet map[string]bool) CategoryHolderCounts {
+	filtered := CategoryHolderCounts{Whales: CountsMap{}, Retail: CountsMap{}, Lps: CountsMap{}}
+	for t, v := range data.Whales {
+		if timesSet[t] {
+			filtered.Whales[t] = v
+		}
+	}
+	for t, v := range data.Retail {
+		if timesSet[t] {
+			filtered.Retail[t] = v
+		}
+	}
+	for t, v := range data.Lps {
+		if timesSet[t] {
+			filtered.Lps[t] = v
+		}
+	}
+	return filtered
+}
+
+/*
+func paginateSrsData(data *ComputedDataType, page, limit int) PaginatedSrsResponse {
+	allHoldingTimes := make([]string, 0, len(data.ProcessedHoldings.Whales))
+	for t := range data.ProcessedHoldings.Whales {
+		allHoldingTimes = append(allHoldingTimes, t)
+	}
+	sort.Slice(allHoldingTimes, func(i, j int) bool { return allHoldingTimes[i] > allHoldingTimes[j] })
+
+	totalItems := len(allHoldingTimes)
+	totalPages := 0
+	if totalItems > 0 && limit > 0 {
+		totalPages = int(math.Ceil(float64(totalItems) / float64(limit)))
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages && totalPages > 0 {
+		page = totalPages
+	}
+
+	startIndex, endIndex := (page-1)*limit, page*limit
+	var paginatedTimesSlice []string
+	if startIndex < totalItems {
+		if endIndex > totalItems {
+			endIndex = totalItems
+		}
+		paginatedTimesSlice = allHoldingTimes[startIndex:endIndex]
+	} else {
+		paginatedTimesSlice = []string{}
+	}
+
+	paginatedTimesSet := make(map[string]bool)
+	for _, t := range paginatedTimesSlice {
+		paginatedTimesSet[t] = true
+	}
+
+	return PaginatedSrsResponse{
+		ProcessedHoldings:     filterCategoryHoldingsByTimes(data.ProcessedHoldings, paginatedTimesSet),
+		ProcessedHolderCounts: filterCategoryHolderCountsByTimes(data.ProcessedHolderCounts, paginatedTimesSet),
+		Page:                  page, TotalPages: totalPages, TotalItems: totalItems,
+	}
+}
+*/
+// paginateSrsData handles pagination efficiently by building the final response struct directly,
+// avoiding unnecessary allocations and iterations.
+func paginateSrsData(data *ComputedDataType, page, limit int) PaginatedSrsResponse {
+	// This initial logic to get all timestamps and calculate pages is correct.
+	allHoldingTimes := make([]string, 0, len(data.ProcessedHoldings.Whales))
+	for t := range data.ProcessedHoldings.Whales {
+		allHoldingTimes = append(allHoldingTimes, t)
+	}
+	sort.Slice(allHoldingTimes, func(i, j int) bool { return allHoldingTimes[i] > allHoldingTimes[j] })
+
+	totalItems := len(allHoldingTimes)
+	if limit <= 0 {
+		limit = defaultSrsLimit
+	}
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = int(math.Ceil(float64(totalItems) / float64(limit)))
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages && totalPages > 0 {
+		page = totalPages
+	}
+
+	startIndex, endIndex := (page-1)*limit, page*limit
+	var paginatedTimesSlice []string
+	if startIndex < totalItems {
+		if endIndex > totalItems {
+			endIndex = totalItems
+		}
+		paginatedTimesSlice = allHoldingTimes[startIndex:endIndex]
+	} else {
+		paginatedTimesSlice = []string{}
+	}
+
+	// --- CRITICAL OPTIMIZATION ---
+	// Create the final response struct and initialize its maps.
+	// This avoids creating temporary structs and maps in helper functions.
+	response := PaginatedSrsResponse{
+		ProcessedHoldings: CategoryHoldings{
+			Whales: make(HoldingsMap, len(paginatedTimesSlice)),
+			Retail: make(HoldingsMap, len(paginatedTimesSlice)),
+			Lps:    make(HoldingsMap, len(paginatedTimesSlice)),
+		},
+		ProcessedHolderCounts: CategoryHolderCounts{
+			Whales: make(CountsMap, len(paginatedTimesSlice)),
+			Retail: make(CountsMap, len(paginatedTimesSlice)),
+			Lps:    make(CountsMap, len(paginatedTimesSlice)),
+		},
+		Page:       page,
+		TotalPages: totalPages,
+		TotalItems: totalItems,
+	}
+
+	// Iterate ONLY over the small slice of timestamps for the current page.
+	for _, t := range paginatedTimesSlice {
+		// Populate the holdings maps directly in the final response object.
+		if val, ok := data.ProcessedHoldings.Whales[t]; ok {
+			response.ProcessedHoldings.Whales[t] = val
+		}
+		if val, ok := data.ProcessedHoldings.Retail[t]; ok {
+			response.ProcessedHoldings.Retail[t] = val
+		}
+		if val, ok := data.ProcessedHoldings.Lps[t]; ok {
+			response.ProcessedHoldings.Lps[t] = val
+		}
+
+		// Populate the counts maps directly.
+		if val, ok := data.ProcessedHolderCounts.Whales[t]; ok {
+			response.ProcessedHolderCounts.Whales[t] = val
+		}
+		if val, ok := data.ProcessedHolderCounts.Retail[t]; ok {
+			response.ProcessedHolderCounts.Retail[t] = val
+		}
+		if val, ok := data.ProcessedHolderCounts.Lps[t]; ok {
+			response.ProcessedHolderCounts.Lps[t] = val
+		}
+	}
+
+	return response
+}
+
+// NOTE: You should now DELETE the old `filterCategoryHoldingsByTimes` and
+// `filterCategoryHolderCountsByTimes` functions as they are no longer used.

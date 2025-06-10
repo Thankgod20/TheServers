@@ -1,0 +1,369 @@
+package api
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"math"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-redis/redis"
+	holders "github.com/thankgod20/scraperServer/Holders"
+)
+
+const (
+	aggregateCacheTTL       = 5 * time.Minute
+	defaultAggregatePage    = 1
+	defaultAggregateLimit   = 50
+	redisAggregateKeyPrefix = "aggregate:"
+)
+
+// ----- Types (Unchanged) -----
+
+type NullTime struct {
+	time.Time
+}
+
+// UnmarshalJSON handles custom unmarshalling for NullTime.
+// This is required for the streaming decoder to work correctly with your custom type.
+func (nt *NullTime) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), "\"")
+	if s == "null" || s == "" {
+		nt.Time = time.Time{}
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return err
+	}
+	nt.Time = t
+	return nil
+}
+
+type Transfer struct {
+	Address string   `json:"address"`
+	Amount  float64  `json:"amount"`
+	Time    NullTime `json:"time"`
+	Price   float64  `json:"price"`
+}
+
+type AggregatedEntry struct {
+	Price  float64 `json:"price"`
+	Amount float64 `json:"amount"`
+	Time   string  `json:"time"`
+}
+
+type PaginatedAggregatedResponse struct {
+	Holders    []AggregatedEntry `json:"holders"`
+	Page       int               `json:"page"`
+	TotalPages int               `json:"totalPages"`
+	TotalItems int               `json:"totalItems"`
+}
+
+// ----- Service Definition (Unchanged) -----
+
+type AggregateService struct {
+	redisClient    *redis.Client
+	bitqueryClient *holders.BitqueryClient
+	refreshing     map[string]bool
+	refreshingLock sync.Mutex
+}
+
+func NewAggregateService(redisClient *redis.Client, bqClient *holders.BitqueryClient) *AggregateService {
+	return &AggregateService{
+		redisClient:    redisClient,
+		bitqueryClient: bqClient,
+		refreshing:     make(map[string]bool),
+	}
+}
+
+// ----- Helper Functions (Unchanged) -----
+
+func roundTimeToMinuteStartAndFormat(t time.Time) (string, error) {
+	if t.IsZero() {
+		return "", fmt.Errorf("cannot round a zero time value")
+	}
+	roundedTime := t.Truncate(time.Minute)
+	return roundedTime.Format(time.RFC3339), nil
+}
+
+func compress(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, err := gw.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	gw.Close()
+	return buf.Bytes(), nil
+}
+
+func decompress(data []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return ioutil.ReadAll(r)
+}
+
+// ----- Core Logic (Refactored) -----
+
+// streamAndAggregateData is the new, memory-efficient processing function.
+// It uses a streaming JSON decoder to process one transfer at a time,
+// preventing the entire transfer history from being loaded into memory.
+func (s *AggregateService) streamAndAggregateData(jsonData io.Reader) ([]AggregatedEntry, error) {
+	aggregatedDataMap := make(map[string]AggregatedEntry)
+	decoder := json.NewDecoder(jsonData)
+
+	// The JSON is an array, so we first read the opening bracket '['.
+	_, err := decoder.Token()
+	if err != nil {
+		if err == io.EOF { // Handle empty input gracefully
+			return []AggregatedEntry{}, nil
+		}
+		return nil, fmt.Errorf("failed to read opening bracket from JSON stream: %w", err)
+	}
+
+	// Loop through the array, decoding one Transfer object at a time.
+	for decoder.More() {
+		var entry Transfer
+		if err := decoder.Decode(&entry); err != nil {
+			log.Printf("Warning: Skipping an entry due to decoding error: %v", err)
+			continue
+		}
+
+		price := entry.Price
+		amount := entry.Amount
+
+		if entry.Time.IsZero() {
+			continue // Skip entries with null/zero time
+		}
+
+		formattedTime, err := roundTimeToMinuteStartAndFormat(entry.Time.Time)
+		if err != nil {
+			log.Printf("Warning: Skipping entry for address %s due to time formatting error: %v", entry.Address, err)
+			continue
+		}
+
+		key := fmt.Sprintf("%.2f_%s", price, formattedTime)
+
+		if existing, ok := aggregatedDataMap[key]; ok {
+			existing.Amount += amount
+			aggregatedDataMap[key] = existing
+		} else {
+			aggregatedDataMap[key] = AggregatedEntry{
+				Price:  price,
+				Amount: amount,
+				Time:   formattedTime,
+			}
+		}
+	}
+
+	// The rest of the logic is the same: convert map to slice and sort.
+	resultList := make([]AggregatedEntry, 0, len(aggregatedDataMap))
+	for _, data := range aggregatedDataMap {
+		resultList = append(resultList, data)
+	}
+
+	sort.Slice(resultList, func(i, j int) bool {
+		return resultList[i].Time > resultList[j].Time
+	})
+
+	return resultList, nil
+}
+
+// computeAndAggregateData now orchestrates fetching and streaming.
+// It gets the raw data and passes it as a stream to the efficient processing function.
+func (s *AggregateService) computeAndAggregateData(ctx context.Context, address string) ([]AggregatedEntry, error) {
+	rawJsonData, err := s.bitqueryClient.UpdateAndGetTransfers(s.redisClient, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch transfers via BitqueryClient for address %s: %w", address, err)
+	}
+
+	if len(rawJsonData) == 0 {
+		log.Printf("No transfers found for address %s after fetching.", address)
+		return []AggregatedEntry{}, nil
+	}
+
+	// Create a reader from the raw JSON bytes and pass it to the streaming processor.
+	// This avoids unmarshalling the entire byte slice into a large Go slice.
+	jsonStream := bytes.NewReader([]byte(rawJsonData))
+	result, err := s.streamAndAggregateData(jsonStream)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process transfer stream for address %s: %w", address, err)
+	}
+
+	log.Printf("Successfully computed and aggregated data for address %s. Resulted in %d aggregated entries.", address, len(result))
+	return result, nil
+}
+
+// ----- Caching and HTTP Handler (Unchanged) -----
+
+// triggerAggregateBackgroundRefresh refreshes cache in background.
+func (s *AggregateService) triggerAggregateBackgroundRefresh(initiatingCtx context.Context, redisStoreKey, address string) {
+	s.refreshingLock.Lock()
+	if s.refreshing[redisStoreKey] {
+		s.refreshingLock.Unlock()
+		log.Printf("Aggregate background refresh for %s is already in progress.", redisStoreKey)
+		return
+	}
+	s.refreshing[redisStoreKey] = true
+	s.refreshingLock.Unlock()
+
+	log.Printf("Triggering Aggregate background refresh for %s", redisStoreKey)
+
+	go func() {
+		defer func() {
+			s.refreshingLock.Lock()
+			delete(s.refreshing, redisStoreKey)
+			s.refreshingLock.Unlock()
+			log.Printf("Aggregate background refresh goroutine for %s has finished.", redisStoreKey)
+		}()
+
+		bgCtx := context.Background()
+		data, err := s.computeAndAggregateData(bgCtx, address)
+		if err != nil {
+			log.Printf("Error during Aggregate background refresh for %s: %v", redisStoreKey, err)
+			return
+		}
+
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			log.Printf("Error marshalling data for Aggregate background refresh cache %s: %v", redisStoreKey, err)
+			return
+		}
+		compressedData, _ := compress(jsonData)
+		err = s.redisClient.Set(redisStoreKey, compressedData, aggregateCacheTTL).Err()
+		if err != nil {
+			log.Printf("Error setting Redis cache during Aggregate background refresh %s: %v", redisStoreKey, err)
+		} else {
+			log.Printf("Aggregate cache refreshed in background for %s", redisStoreKey)
+		}
+	}()
+}
+
+// paginateAggregatedData handles pagination logic for []AggregatedEntry.
+func paginateAggregatedData(data []AggregatedEntry, page, limit int) PaginatedAggregatedResponse {
+	totalItems := len(data)
+	if limit <= 0 {
+		limit = defaultAggregateLimit
+	}
+
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = int(math.Ceil(float64(totalItems) / float64(limit)))
+	}
+
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages && totalPages > 0 {
+		page = totalPages
+	}
+
+	startIndex := (page - 1) * limit
+	endIndex := startIndex + limit
+	var paginatedSlice []AggregatedEntry
+
+	if startIndex < totalItems {
+		if endIndex > totalItems {
+			endIndex = totalItems
+		}
+		paginatedSlice = data[startIndex:endIndex]
+	} else {
+		paginatedSlice = []AggregatedEntry{}
+	}
+
+	return PaginatedAggregatedResponse{
+		Holders:    paginatedSlice,
+		Page:       page,
+		TotalPages: totalPages,
+		TotalItems: totalItems,
+	}
+}
+
+// HandleAggregateRequest is the HTTP handler for this aggregated data endpoint.
+func (s *AggregateService) HandleAggregateRequest(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	address := r.URL.Query().Get("address")
+	pageStr := r.URL.Query().Get("page")
+	limitStr := r.URL.Query().Get("limit")
+
+	if address == "" {
+		http.Error(w, `{"error": "Missing address"}`, http.StatusBadRequest)
+		return
+	}
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page < 1 {
+		page = defaultAggregatePage
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = defaultAggregateLimit
+	}
+
+	redisStoreKey := fmt.Sprintf("%s%s", redisAggregateKeyPrefix, address)
+	log.Printf("New Aggregate request - address: %s, page: %d, limit: %d. Redis key: %s", address, page, limit, redisStoreKey)
+
+	cacheEntryStr, redisErr := s.redisClient.Get(redisStoreKey).Result()
+	if redisErr == nil {
+		log.Printf("Aggregate cache hit for %s. Serving stale cache and refreshing in background.", redisStoreKey)
+		s.triggerAggregateBackgroundRefresh(ctx, redisStoreKey, address)
+
+		cacheEntry, err := decompress([]byte(cacheEntryStr))
+		if err != nil {
+			log.Printf("Error decompressing cached Aggregate data for %s: %v. Will recompute.", redisStoreKey, err)
+		} else {
+			var cachedData []AggregatedEntry
+			if err := json.Unmarshal(cacheEntry, &cachedData); err != nil {
+				log.Printf("Error unmarshalling cached Aggregate data for %s: %v. Will recompute.", redisStoreKey, err)
+			} else {
+				result := paginateAggregatedData(cachedData, page, limit)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(result)
+				return
+			}
+		}
+	} else if redisErr != redis.Nil {
+		log.Printf("Redis error (excluding Nil) for key %s: %v. Computing new data.", redisStoreKey, redisErr)
+	} else {
+		log.Printf("Aggregate cache miss for %s.", redisStoreKey)
+	}
+
+	log.Printf("Aggregate computing new data for %s and caching.", redisStoreKey)
+	computedData, err := s.computeAndAggregateData(ctx, address)
+	if err != nil {
+		log.Printf("Error computing Aggregate data for address %s: %v", address, err)
+		http.Error(w, `{"error": "Internal Server Error during data computation"}`, http.StatusInternalServerError)
+		return
+	}
+
+	dataJSON, err := json.Marshal(computedData)
+	if err != nil {
+		log.Printf("Error marshalling computed Aggregate data for %s: %v", redisStoreKey, err)
+	} else {
+		compressedData, _ := compress(dataJSON)
+		if setErr := s.redisClient.Set(redisStoreKey, compressedData, aggregateCacheTTL).Err(); setErr != nil {
+			log.Printf("Error setting Redis cache for key %s: %v", redisStoreKey, setErr)
+		} else {
+			log.Printf("Aggregate data cached successfully for %s", redisStoreKey)
+		}
+	}
+
+	result := paginateAggregatedData(computedData, page, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}

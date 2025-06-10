@@ -1,0 +1,1032 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-redis/redis"
+	"golang.org/x/sync/singleflight" // Import the singleflight package
+)
+
+const CACHE_TTL = 5 * time.Minute
+
+// ----- Type Definitions -----
+
+type Holder struct {
+	Address string    `json:"address"`
+	Amount  []float64 `json:"amount"`
+	Time    []string  `json:"time"`
+}
+
+type OHLCVData struct {
+	Data struct {
+		Attributes struct {
+			OHLCVList [][]interface{} `json:"ohlcv_list"`
+		} `json:"attributes"`
+	} `json:"data"`
+}
+
+type FlowData struct {
+	Timestamps    []string             `json:"timestamps"`
+	Prices        PriceData            `json:"prices"`
+	Inflow        map[string][]float64 `json:"inflow"`
+	Outflow       map[string][]float64 `json:"outflow"`
+	Netflow       map[string][]float64 `json:"netflow"`
+	ActiveHolders map[string][]int     `json:"activeHolders"`
+	NetflowColors map[string][]string  `json:"netflowColors"`
+	NewAddresses  []int                `json:"newAddresses"`
+}
+
+type PaginatedFlowData struct {
+	FlowData
+	Page       int `json:"page"`
+	TotalPages int `json:"totalPages"`
+	TotalItems int `json:"totalItems"`
+}
+
+type PriceData struct {
+	Timestamps []string  `json:"timestamps"`
+	Values     []float64 `json:"values"`
+}
+
+// ----- Service and Helper Functions -----
+
+// FlowAnalyticsService now includes a singleflight.Group to prevent thundering herds.
+type FlowAnalyticsService struct {
+	redisClient *redis.Client
+	lastRefresh sync.Map           // key: redisKey, value: time.Time
+	sfGroup     singleflight.Group // Request coalescing group
+}
+
+func NewFlowAnalyticsService(redisClient *redis.Client) *FlowAnalyticsService {
+	return &FlowAnalyticsService{
+		redisClient: redisClient,
+		// sfGroup is zero-value ready
+	}
+}
+
+func (s *FlowAnalyticsService) getCategory(balance float64) string {
+	if balance > 10_000_000 {
+		return "whale"
+	}
+	if balance > 1_000_000 {
+		return "shark"
+	}
+	return "retail"
+}
+
+// logMemUsage prints the current memory usage statistics.
+func logMemUsage(stage string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	// Alloc is bytes of allocated heap objects.
+	// TotalAlloc is cumulative bytes allocated for heap objects.
+	// Sys is the total bytes of memory obtained from the OS.
+	log.Printf("[MEM-PROFILE] Stage: %s | Alloc = %v MiB | TotalAlloc = %v MiB | Sys = %v MiB | NumGC = %v",
+		stage,
+		m.Alloc/1024/1024,
+		m.TotalAlloc/1024/1024,
+		m.Sys/1024/1024,
+		m.NumGC)
+}
+func (s *FlowAnalyticsService) getCacheKey(address string, lps []string) string {
+	lpsKey := ""
+	if len(lps) > 0 {
+		sort.Strings(lps)
+		lpsKey = strings.Join(lps, ",")
+	}
+	return fmt.Sprintf("%s|%s", address, lpsKey)
+}
+
+func (s *FlowAnalyticsService) nearestIndex(timestamps []time.Time, target time.Time) int {
+	idx := sort.Search(len(timestamps), func(i int) bool {
+		return timestamps[i].After(target) || timestamps[i].Equal(target)
+	})
+	if idx > 0 && (idx == len(timestamps) || timestamps[idx].Sub(target) > target.Sub(timestamps[idx-1])) {
+		return idx - 1
+	}
+	return idx
+}
+
+func (s *FlowAnalyticsService) colorByValue(arr []float64) []string {
+	colors := make([]string, len(arr))
+	for i, v := range arr {
+		if v >= 0 {
+			colors[i] = "green"
+		} else {
+			colors[i] = "red"
+		}
+	}
+	return colors
+}
+
+// ----- Core Data Logic -----
+
+func (s *FlowAnalyticsService) getDataFromRedis(ctx context.Context, address string) ([]byte, OHLCVData, error) {
+	holderKey := fmt.Sprintf("holderhistory:%s", address)
+	holderJSONStr, err := s.redisClient.Get(holderKey).Result()
+	if err != nil {
+		return nil, OHLCVData{}, fmt.Errorf("failed to get holder history from Redis: %w", err)
+	}
+	holderJSON, _ := decompress([]byte(holderJSONStr))
+
+	ohlcvKey := fmt.Sprintf("ohlcv:%s", address)
+	ohlcvJSONStr, err := s.redisClient.Get(ohlcvKey).Result()
+	if err != nil {
+		return nil, OHLCVData{}, fmt.Errorf("failed to get OHLCV data from Redis: %w", err)
+	}
+	ohlcvJSON, _ := decompress([]byte(ohlcvJSONStr))
+
+	var ohlcv OHLCVData
+	if err := json.Unmarshal(ohlcvJSON, &ohlcv); err != nil {
+		return nil, OHLCVData{}, fmt.Errorf("failed to parse OHLCV data: %w", err)
+	}
+	if len(ohlcv.Data.Attributes.OHLCVList) == 0 {
+		return nil, OHLCVData{}, fmt.Errorf("no OHLCV data found")
+	}
+	return holderJSON, ohlcv, nil
+}
+
+func decodeAndWrapStream(jsonData []byte) (io.Reader, error) {
+	if bytes.HasPrefix(jsonData, []byte(`[`)) {
+		var wrappedData bytes.Buffer
+		wrappedData.WriteString(`{"holders":`)
+		wrappedData.Write(jsonData)
+		wrappedData.WriteString(`}`)
+		return &wrappedData, nil
+	} else if bytes.HasPrefix(jsonData, []byte(`{`)) {
+		return bytes.NewReader(jsonData), nil
+	}
+	return nil, fmt.Errorf("invalid JSON format: does not start with { or [")
+}
+
+// computeData is the memory-efficient core worker function.
+
+/*
+func (s *FlowAnalyticsService) computeData(ctx context.Context, address string, lps []string) (*FlowData, error) {
+	holderJSONBytes, ohlcv, err := s.getDataFromRedis(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pass 1: Stream to build the canonical timeline.
+	timelineReader, err := decodeAndWrapStream(holderJSONBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not create timeline reader: %w", err)
+	}
+
+	holderTimesSet := make(map[int64]bool)
+	decoder := json.NewDecoder(timelineReader)
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // [
+
+	for decoder.More() {
+		var holder Holder
+		if err := decoder.Decode(&holder); err != nil {
+			return nil, fmt.Errorf("timeline pass: error decoding holder: %w", err)
+		}
+		for _, tsStr := range holder.Time {
+			if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
+				holderTimesSet[t.Unix()] = true
+			}
+		}
+	}
+	if len(holderTimesSet) == 0 {
+		return nil, fmt.Errorf("no valid timestamps found in holder history")
+	}
+
+	var holderTimestampsList []int64
+	for ts := range holderTimesSet {
+		holderTimestampsList = append(holderTimestampsList, ts)
+	}
+	sort.Slice(holderTimestampsList, func(i, j int) bool { return holderTimestampsList[i] < holderTimestampsList[j] })
+
+	canonicalTimestamps := make([]time.Time, len(holderTimestampsList))
+	for i, ts := range holderTimestampsList {
+		canonicalTimestamps[i] = time.Unix(ts, 0)
+	}
+	n := len(canonicalTimestamps)
+
+	// Initialize final data structures.
+	categories := []string{"whale", "shark", "retail"}
+	flattenedHoldings, activeHolders := make(map[string][]float64), make(map[string][]int)
+	for _, cat := range categories {
+		flattenedHoldings[cat], activeHolders[cat] = make([]float64, n), make([]int, n)
+	}
+	activeHolders["total"] = make([]int, n)
+	firstSeenIndexByAddress := make(map[string]int)
+
+	// Pass 2: Stream again with highly optimized, low-churn processing logic.
+	processingReader, err := decodeAndWrapStream(holderJSONBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not create processing reader: %w", err)
+	}
+
+	decoder = json.NewDecoder(processingReader)
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // [
+
+	for decoder.More() {
+		var holder Holder
+		if err := decoder.Decode(&holder); err != nil {
+			return nil, fmt.Errorf("processing pass: error decoding holder: %w", err)
+		}
+		if len(holder.Amount) == 0 || len(holder.Time) != len(holder.Amount) {
+			continue
+		}
+
+		holderTimes := make([]time.Time, len(holder.Time))
+		for i, tsStr := range holder.Time {
+			if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
+				holderTimes[i] = t
+			}
+		}
+
+		category := s.getCategory(holder.Amount[0])
+		holderTimeIdx := 0
+		for i, canonicalTs := range canonicalTimestamps {
+			for holderTimeIdx+1 < len(holderTimes) && !holderTimes[holderTimeIdx+1].After(canonicalTs) {
+				holderTimeIdx++
+			}
+			currentAmount := holder.Amount[holderTimeIdx]
+			flattenedHoldings[category][i] += currentAmount
+			if currentAmount > 10 {
+				activeHolders[category][i]++
+				activeHolders["total"][i]++
+			}
+		}
+
+		if _, exists := firstSeenIndexByAddress[holder.Address]; !exists {
+			for i := range holder.Amount {
+				if holder.Amount[i] > 0 && !holderTimes[i].IsZero() {
+					firstSeenIndexByAddress[holder.Address] = s.nearestIndex(canonicalTimestamps, holderTimes[i])
+					break
+				}
+			}
+		}
+	}
+
+	// Final Calculations and Assembly.
+	inflow, outflow, netflow := make(map[string][]float64), make(map[string][]float64), make(map[string][]float64)
+	for _, cat := range categories {
+		inflow[cat], outflow[cat], netflow[cat] = make([]float64, n), make([]float64, n), make([]float64, n)
+		amounts := flattenedHoldings[cat]
+		for i := 0; i < n; i++ {
+			delta := amounts[i]
+			if i > 0 {
+				delta -= amounts[i-1]
+			}
+			netflow[cat][i] = delta
+			if delta > 0 {
+				inflow[cat][i] = delta
+			} else {
+				outflow[cat][i] = math.Abs(delta)
+			}
+		}
+	}
+
+	newAddresses := make([]int, n)
+	for _, idx := range firstSeenIndexByAddress {
+		if idx < n {
+			newAddresses[idx]++
+		}
+	}
+
+	sort.Slice(ohlcv.Data.Attributes.OHLCVList, func(i, j int) bool {
+		return ohlcv.Data.Attributes.OHLCVList[i][0].(float64) < ohlcv.Data.Attributes.OHLCVList[j][0].(float64)
+	})
+	priceTimestamps, prices := make([]string, len(ohlcv.Data.Attributes.OHLCVList)), make([]float64, len(ohlcv.Data.Attributes.OHLCVList))
+	for i, item := range ohlcv.Data.Attributes.OHLCVList {
+		priceTimestamps[i], prices[i] = time.Unix(int64(item[0].(float64)), 0).Format(time.RFC3339), item[4].(float64)
+	}
+
+	timestampStrings := make([]string, n)
+	for i, t := range canonicalTimestamps {
+		timestampStrings[i] = t.Format(time.RFC3339)
+	}
+	netflowColors := make(map[string][]string)
+	for _, category := range categories {
+		netflowColors[category] = s.colorByValue(netflow[category])
+	}
+
+	return &FlowData{
+		Timestamps: timestampStrings, Prices: PriceData{Timestamps: priceTimestamps, Values: prices},
+		Inflow: inflow, Outflow: outflow, Netflow: netflow,
+		ActiveHolders: activeHolders, NetflowColors: netflowColors, NewAddresses: newAddresses,
+	}, nil
+}*/
+
+// Helper function to parse timestamps more flexibly, similar to JS `new Date()`
+func parseFlexibleTime(tsStr string) (time.Time, error) {
+	// Try RFC3339Nano first, as it's more specific
+	t, err := time.Parse(time.RFC3339Nano, tsStr)
+	if err == nil {
+		return t, nil
+	}
+	// Fall back to RFC3339
+	return time.Parse(time.RFC3339, tsStr)
+}
+
+// computeData is the memory-efficient core worker function.
+// computeData is the memory-efficient core worker function.
+func (s *FlowAnalyticsService) computeData(ctx context.Context, address string, lps []string) (*FlowData, error) {
+	logMemUsage("computeData - Start")
+	holderJSONBytes, ohlcv, err := s.getDataFromRedis(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+	logMemUsage("computeData - After getDataFromRedis & Decompress")
+	// <-- MEASURE 1: Baseline
+	// Pass 1: Build the canonical timeline (this part is now correct)
+	timelineReader, err := decodeAndWrapStream(holderJSONBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not create timeline reader: %w", err)
+	}
+	holderTimesSet := make(map[int64]bool)
+	decoder := json.NewDecoder(timelineReader)
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // [
+	for decoder.More() {
+		var holder Holder
+		if err := decoder.Decode(&holder); err != nil {
+			log.Printf("timeline pass: warning: could not decode a holder object: %v", err)
+			continue
+		}
+		for _, tsStr := range holder.Time {
+			if t, err := parseFlexibleTime(tsStr); err == nil {
+				holderTimesSet[t.Unix()] = true
+			}
+		}
+	}
+	if len(holderTimesSet) == 0 {
+		return nil, fmt.Errorf("no valid timestamps found in holder history")
+	}
+	var holderTimestampsList []int64
+	for ts := range holderTimesSet {
+		holderTimestampsList = append(holderTimestampsList, ts)
+	}
+	sort.Slice(holderTimestampsList, func(i, j int) bool { return holderTimestampsList[i] < holderTimestampsList[j] })
+	canonicalTimestamps := make([]time.Time, len(holderTimestampsList))
+	for i, ts := range holderTimestampsList {
+		canonicalTimestamps[i] = time.Unix(ts, 0)
+	}
+	n := len(canonicalTimestamps)
+	log.Printf("Processing token %s with %d unique timestamps.", address, n)
+	logMemUsage("computeData - After Pass 1 (Timeline built)") // <-- MEASURE 3
+	// Initialize final data structures.
+	categories := []string{"whale", "shark", "retail"}
+	flattenedHoldings, activeHolders := make(map[string][]float64), make(map[string][]int)
+	for _, cat := range categories {
+		flattenedHoldings[cat], activeHolders[cat] = make([]float64, n), make([]int, n)
+	}
+	activeHolders["total"] = make([]int, n)
+	firstSeenIndexByAddress := make(map[string]int)
+	logMemUsage("computeData - After Allocating 'flattenedHoldings'") // <-- MEASURE 4: BIG JUMP HERE
+
+	// Pass 2: Stream again with corrected logic.
+	processingReader, err := decodeAndWrapStream(holderJSONBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not create processing reader: %w", err)
+	}
+	decoder = json.NewDecoder(processingReader)
+	if _, err = decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err = decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err = decoder.Token(); err != nil {
+		return nil, err
+	} // [
+
+	for decoder.More() {
+		var holder Holder
+		if err := decoder.Decode(&holder); err != nil {
+			return nil, fmt.Errorf("processing pass: error decoding holder: %w", err)
+		}
+		if len(holder.Amount) == 0 || len(holder.Time) != len(holder.Amount) {
+			continue
+		}
+
+		holderTimes := make([]time.Time, len(holder.Time))
+		for i, tsStr := range holder.Time {
+			if t, err := parseFlexibleTime(tsStr); err == nil {
+				holderTimes[i] = t
+			}
+		}
+
+		// --- FIX STARTS HERE ---
+		// Find the first valid time for this specific holder to determine their starting point.
+		var firstHolderTime time.Time
+		for _, t := range holderTimes {
+			if !t.IsZero() {
+				firstHolderTime = t
+				break
+			}
+		}
+		if firstHolderTime.IsZero() {
+			continue // Skip holder if they have no valid timestamps.
+		}
+
+		// Use nearestIndex to find where this holder's activity begins on the canonical timeline.
+		// This replicates the `startIdx` logic from the JS code.
+		startIdx := s.nearestIndex(canonicalTimestamps, firstHolderTime)
+		// --- FIX ENDS HERE ---
+
+		category := s.getCategory(holder.Amount[0])
+		holderTimeIdx := 0
+
+		// CRITICAL CHANGE: Start the loop from `startIdx`, not from 0.
+		for i := startIdx; i < n; i++ {
+			canonicalTs := canonicalTimestamps[i]
+			// This inner loop correctly finds the holder's balance at the given canonical timestamp.
+			for holderTimeIdx+1 < len(holderTimes) && !holderTimes[holderTimeIdx+1].After(canonicalTs) {
+				holderTimeIdx++
+			}
+			currentAmount := holder.Amount[holderTimeIdx]
+			flattenedHoldings[category][i] += currentAmount
+			if currentAmount > 10 {
+				activeHolders[category][i]++
+				activeHolders["total"][i]++
+			}
+		}
+
+		if _, exists := firstSeenIndexByAddress[holder.Address]; !exists {
+			for i := range holder.Amount {
+				if holder.Amount[i] > 0 && !holderTimes[i].IsZero() {
+					// We can reuse the firstHolderTime and startIdx from above for efficiency
+					firstSeenIndexByAddress[holder.Address] = startIdx
+					break
+				}
+			}
+		}
+	}
+	logMemUsage("computeData - After Pass 2 (Holdings populated)") // <-- MEASURE 5
+
+	// Final Calculations and Assembly (no changes needed from here down).
+	inflow, outflow, netflow := make(map[string][]float64), make(map[string][]float64), make(map[string][]float64)
+	for _, cat := range categories {
+		inflow[cat], outflow[cat], netflow[cat] = make([]float64, n), make([]float64, n), make([]float64, n)
+		amounts := flattenedHoldings[cat]
+		for i := 0; i < n; i++ {
+			delta := amounts[i]
+			if i > 0 {
+				delta -= amounts[i-1]
+			}
+			netflow[cat][i] = delta
+			if delta > 0 {
+				inflow[cat][i] = delta
+			} else {
+				outflow[cat][i] = math.Abs(delta)
+			}
+		}
+	}
+
+	newAddresses := make([]int, n)
+	for _, idx := range firstSeenIndexByAddress {
+		if idx < n {
+			newAddresses[idx]++
+		}
+	}
+
+	sort.Slice(ohlcv.Data.Attributes.OHLCVList, func(i, j int) bool {
+		return ohlcv.Data.Attributes.OHLCVList[i][0].(float64) < ohlcv.Data.Attributes.OHLCVList[j][0].(float64)
+	})
+	priceTimestamps, prices := make([]string, len(ohlcv.Data.Attributes.OHLCVList)), make([]float64, len(ohlcv.Data.Attributes.OHLCVList))
+	for i, item := range ohlcv.Data.Attributes.OHLCVList {
+		priceTimestamps[i] = time.Unix(int64(item[0].(float64)), 0).Format(time.RFC3339Nano)
+		prices[i] = item[4].(float64)
+	}
+
+	timestampStrings := make([]string, n)
+	for i, t := range canonicalTimestamps {
+		timestampStrings[i] = t.Format(time.RFC3339Nano)
+	}
+	netflowColors := make(map[string][]string)
+	for _, category := range categories {
+		netflowColors[category] = s.colorByValue(netflow[category])
+	}
+	logMemUsage("computeData - After Allocating 'netflow' slices") // <-- MEASURE 6: ANOTHER JUMP HERE
+
+	return &FlowData{
+		Timestamps: timestampStrings, Prices: PriceData{Timestamps: priceTimestamps, Values: prices},
+		Inflow: inflow, Outflow: outflow, Netflow: netflow,
+		ActiveHolders: activeHolders, NetflowColors: netflowColors, NewAddresses: newAddresses,
+	}, nil
+}
+
+/*
+func (s *FlowAnalyticsService) computeData(ctx context.Context, address string, lps []string) (*FlowData, error) {
+	holderJSONBytes, ohlcv, err := s.getDataFromRedis(ctx, address)
+	if err != nil {
+		return nil, err
+	}
+
+	// Pass 1: Stream to build the canonical timeline.
+	timelineReader, err := decodeAndWrapStream(holderJSONBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not create timeline reader: %w", err)
+	}
+
+	holderTimesSet := make(map[int64]bool)
+	decoder := json.NewDecoder(timelineReader)
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // [
+
+	for decoder.More() {
+		var holder Holder
+		if err := decoder.Decode(&holder); err != nil {
+			// Log this error but continue, as some entries might be malformed
+			log.Printf("timeline pass: warning: could not decode a holder object: %v", err)
+			continue
+		}
+		for _, tsStr := range holder.Time {
+			// FIX: Use the new flexible time parsing function
+			if t, err := parseFlexibleTime(tsStr); err == nil {
+				holderTimesSet[t.Unix()] = true
+			} else {
+				// Log if a timestamp is truly unparseable
+				// log.Printf("Could not parse timestamp: %s", tsStr)
+			}
+		}
+	}
+	if len(holderTimesSet) == 0 {
+		return nil, fmt.Errorf("no valid timestamps found in holder history")
+	}
+
+	// The rest of the function remains identical to your original
+	// ... (code for sorting timestamps, initializing structures, second pass, etc.) ...
+	// ...
+	// [NO OTHER CHANGES ARE NEEDED IN THIS FUNCTION]
+	// ...
+
+	var holderTimestampsList []int64
+	for ts := range holderTimesSet {
+		holderTimestampsList = append(holderTimestampsList, ts)
+	}
+	sort.Slice(holderTimestampsList, func(i, j int) bool { return holderTimestampsList[i] < holderTimestampsList[j] })
+
+	canonicalTimestamps := make([]time.Time, len(holderTimestampsList))
+	for i, ts := range holderTimestampsList {
+		canonicalTimestamps[i] = time.Unix(ts, 0)
+	}
+	n := len(canonicalTimestamps)
+
+	// Initialize final data structures.
+	categories := []string{"whale", "shark", "retail"}
+	flattenedHoldings, activeHolders := make(map[string][]float64), make(map[string][]int)
+	for _, cat := range categories {
+		flattenedHoldings[cat], activeHolders[cat] = make([]float64, n), make([]int, n)
+	}
+	activeHolders["total"] = make([]int, n)
+	firstSeenIndexByAddress := make(map[string]int)
+
+	// Pass 2: Stream again with highly optimized, low-churn processing logic.
+	processingReader, err := decodeAndWrapStream(holderJSONBytes)
+	if err != nil {
+		return nil, fmt.Errorf("could not create processing reader: %w", err)
+	}
+
+	decoder = json.NewDecoder(processingReader)
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // {
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // "holders"
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	} // [
+
+	for decoder.More() {
+		var holder Holder
+		if err := decoder.Decode(&holder); err != nil {
+			return nil, fmt.Errorf("processing pass: error decoding holder: %w", err)
+		}
+		if len(holder.Amount) == 0 || len(holder.Time) != len(holder.Amount) {
+			continue
+		}
+
+		holderTimes := make([]time.Time, len(holder.Time))
+		for i, tsStr := range holder.Time {
+			if t, err := parseFlexibleTime(tsStr); err == nil {
+				holderTimes[i] = t
+			}
+		}
+
+		category := s.getCategory(holder.Amount[0])
+		holderTimeIdx := 0
+		for i, canonicalTs := range canonicalTimestamps {
+			for holderTimeIdx+1 < len(holderTimes) && !holderTimes[holderTimeIdx+1].After(canonicalTs) {
+				holderTimeIdx++
+			}
+			currentAmount := holder.Amount[holderTimeIdx]
+			flattenedHoldings[category][i] += currentAmount
+			if currentAmount > 10 {
+				activeHolders[category][i]++
+				activeHolders["total"][i]++
+			}
+		}
+
+		if _, exists := firstSeenIndexByAddress[holder.Address]; !exists {
+			for i := range holder.Amount {
+				if holder.Amount[i] > 0 && !holderTimes[i].IsZero() {
+					firstSeenIndexByAddress[holder.Address] = s.nearestIndex(canonicalTimestamps, holderTimes[i])
+					break
+				}
+			}
+		}
+	}
+
+	// Final Calculations and Assembly.
+	inflow, outflow, netflow := make(map[string][]float64), make(map[string][]float64), make(map[string][]float64)
+	for _, cat := range categories {
+		inflow[cat], outflow[cat], netflow[cat] = make([]float64, n), make([]float64, n), make([]float64, n)
+		amounts := flattenedHoldings[cat]
+		for i := 0; i < n; i++ {
+			delta := amounts[i]
+			if i > 0 {
+				delta -= amounts[i-1]
+			}
+			netflow[cat][i] = delta
+			if delta > 0 {
+				inflow[cat][i] = delta
+			} else {
+				outflow[cat][i] = math.Abs(delta)
+			}
+		}
+	}
+
+	newAddresses := make([]int, n)
+	for _, idx := range firstSeenIndexByAddress {
+		if idx < n {
+			newAddresses[idx]++
+		}
+	}
+
+	sort.Slice(ohlcv.Data.Attributes.OHLCVList, func(i, j int) bool {
+		return ohlcv.Data.Attributes.OHLCVList[i][0].(float64) < ohlcv.Data.Attributes.OHLCVList[j][0].(float64)
+	})
+	priceTimestamps, prices := make([]string, len(ohlcv.Data.Attributes.OHLCVList)), make([]float64, len(ohlcv.Data.Attributes.OHLCVList))
+	for i, item := range ohlcv.Data.Attributes.OHLCVList {
+		priceTimestamps[i], prices[i] = time.Unix(int64(item[0].(float64)), 0).Format(time.RFC3339Nano), item[4].(float64)
+	}
+
+	timestampStrings := make([]string, n)
+	for i, t := range canonicalTimestamps {
+		timestampStrings[i] = t.Format(time.RFC3339Nano)
+	}
+	netflowColors := make(map[string][]string)
+	for _, category := range categories {
+		netflowColors[category] = s.colorByValue(netflow[category])
+	}
+
+	return &FlowData{
+		Timestamps: timestampStrings, Prices: PriceData{Timestamps: priceTimestamps, Values: prices},
+		Inflow: inflow, Outflow: outflow, Netflow: netflow,
+		ActiveHolders: activeHolders, NetflowColors: netflowColors, NewAddresses: newAddresses,
+	}, nil
+}*/
+
+// ----- HTTP Handler and Caching -----
+
+// Helper struct to pass results from singleflight.
+type computationResult struct {
+	dataBytes []byte
+}
+
+// HandleFlowAnalytics is the concurrency-safe HTTP handler.
+func (s *FlowAnalyticsService) HandleFlowAnalytics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Parameter Parsing
+	address := r.URL.Query().Get("address")
+	if address == "" {
+		http.Error(w, `{"error": "Address is required"}`, http.StatusBadRequest)
+		return
+	}
+	lpsParam := r.URL.Query().Get("lps")
+	var lps []string
+	if lpsParam != "" {
+		lps = strings.Split(lpsParam, ",")
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 10
+	}
+
+	cacheKey := s.getCacheKey(address, lps)
+	redisKey := fmt.Sprintf("flow:%s", cacheKey)
+	log.Printf("New request - cache key: %s, redis key: %s", cacheKey, redisKey)
+
+	// Step 1: Check Cache
+	/*cachedDataStr, err := s.redisClient.Get(redisKey).Result()
+	if err == nil {
+		log.Println("Serving stale cache and refreshing in background for", redisKey)
+		s.triggerBackgroundRefresh(ctx, address, redisKey, lps)
+		decompressedData, err := decompress([]byte(cachedDataStr))
+		if err == nil {
+			var data FlowData
+			if err := json.Unmarshal(decompressedData, &data); err == nil {
+				result := s.paginate(&data, page, limit)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(result)
+				return
+			}
+		}
+	} else if err != redis.Nil {
+		log.Printf("Redis error (non-Nil) for %s: %v. Attempting to compute.", redisKey, err)
+	}*/
+	cachedDataStr, err := s.redisClient.Get(redisKey).Result()
+	if err == nil {
+		log.Println("Serving stale cache for", redisKey)
+
+		// Check last refresh timestamp
+		shouldRefresh := false
+		if val, ok := s.lastRefresh.Load(redisKey); ok {
+			if time.Since(val.(time.Time)) > time.Minute {
+				shouldRefresh = true
+			}
+		} else {
+			shouldRefresh = true
+		}
+
+		if shouldRefresh {
+			log.Println("Triggering background refresh for", redisKey)
+			s.lastRefresh.Store(redisKey, time.Now())
+			s.triggerBackgroundRefresh(ctx, address, redisKey, lps)
+		}
+
+		// Serve stale data
+		decompressedData, err := decompress([]byte(cachedDataStr))
+		if err == nil {
+			var data FlowData
+			if err := json.Unmarshal(decompressedData, &data); err == nil {
+				result := s.paginate(&data, page, limit)
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(result)
+				return
+			}
+		}
+	}
+
+	// Step 2: Cache Miss - Use singleflight to compute safely
+	log.Printf("Cache miss for %s. Using singleflight to compute.", redisKey)
+	v, err, _ := s.sfGroup.Do(redisKey, func() (interface{}, error) {
+		log.Printf("Executing expensive computation for %s", redisKey)
+		computedData, err := s.computeData(ctx, address, lps)
+		if err != nil {
+			return nil, err
+		}
+		finalJSON, err := json.Marshal(computedData)
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling final output: %w", err)
+		}
+		compressedData, err := compress(finalJSON)
+		if err == nil {
+			s.redisClient.Set(redisKey, compressedData, CACHE_TTL).Err()
+		}
+		return &computationResult{dataBytes: finalJSON}, nil
+	})
+	s.sfGroup.Forget(redisKey)
+
+	if err != nil {
+		log.Printf("Error during singleflight computation for %s: %v", redisKey, err)
+		http.Error(w, `{"error": "Internal Server Error during data computation"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Step 3: Process the result from singleflight
+	resultData := v.(*computationResult)
+	var data FlowData
+	if err := json.Unmarshal(resultData.dataBytes, &data); err != nil {
+		log.Printf("Error unmarshalling result from singleflight for %s: %v", redisKey, err)
+		http.Error(w, `{"error": "Internal Server Error after computation"}`, http.StatusInternalServerError)
+		return
+	}
+
+	paginatedResult := s.paginate(&data, page, limit)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(paginatedResult)
+}
+
+func (s *FlowAnalyticsService) triggerBackgroundRefresh(ctx context.Context, address, redisKey string, lps []string) {
+	go func() {
+		// Use singleflight to prevent multiple background refreshes from piling up.
+		s.sfGroup.Do(redisKey+"_refresh", func() (interface{}, error) {
+			log.Printf("Triggering background refresh for %s", redisKey)
+			bgCtx := context.Background()
+			data, err := s.computeData(bgCtx, address, lps)
+			if err != nil {
+				log.Printf("Error refreshing cache for %s: %v", redisKey, err)
+				return nil, err
+			}
+			dataJSON, _ := json.Marshal(data)
+			compressedData, _ := compress(dataJSON)
+			s.redisClient.Set(redisKey, compressedData, CACHE_TTL)
+			log.Printf("Cache refreshed for %s", redisKey)
+			return nil, nil // Return value doesn't matter for background task
+		})
+	}()
+}
+
+func findPriceEndIndex(priceTimestamps []string, lastPaginatedTimestamp string) int {
+	targetTime, err := parseFlexibleTime(lastPaginatedTimestamp)
+	if err != nil {
+		// If the timestamp is invalid, return all prices
+		return len(priceTimestamps) - 1
+	}
+
+	for i, tsStr := range priceTimestamps {
+		t, err := parseFlexibleTime(tsStr)
+		if err != nil {
+			continue // Skip unparseable price timestamps
+		}
+		if !t.After(targetTime) { // t <= targetTime
+			return i
+		}
+	}
+	// If no timestamp is <= target, it means all prices are newer.
+	// This shouldn't happen if data is correct, but as a fallback, return none.
+	return -1
+}
+
+// paginate handles pagination efficiently and now correctly filters price data.
+func (s *FlowAnalyticsService) paginate(data *FlowData, page, limit int) *PaginatedFlowData {
+	totalItems := len(data.Timestamps)
+	if limit <= 0 {
+		limit = 10
+	}
+	if page < 1 {
+		page = 1
+	}
+	totalPages := 0
+	if totalItems > 0 {
+		totalPages = int(math.Ceil(float64(totalItems) / float64(limit)))
+	}
+	if page > totalPages && totalPages > 0 {
+		page = totalPages
+	}
+
+	// Calculate slice indices for chronological data to get the reverse-ordered page.
+	startIndex, endIndex := (page-1)*limit, page*limit
+	if startIndex >= totalItems {
+		return &PaginatedFlowData{Page: page, TotalPages: totalPages, TotalItems: totalItems} // Return empty for out-of-bounds page
+	}
+	if endIndex > totalItems {
+		endIndex = totalItems
+	}
+	// These are the indices on the original, chronologically sorted array.
+	origStartIndex, origEndIndex := totalItems-endIndex, totalItems-startIndex
+
+	// Correct slice-and-reverse helpers that create copies to avoid data races
+	sliceAndReverse := func(arr []string) []string {
+		if origStartIndex < 0 || origEndIndex > len(arr) || origStartIndex >= origEndIndex {
+			return []string{}
+		}
+		segment := arr[origStartIndex:origEndIndex]
+		newSlice := make([]string, len(segment))
+		copy(newSlice, segment)
+		for i, j := 0, len(newSlice)-1; i < j; i, j = i+1, j-1 {
+			newSlice[i], newSlice[j] = newSlice[j], newSlice[i]
+		}
+		return newSlice
+	}
+	sliceAndReverseFloat := func(arr []float64) []float64 {
+		// (Implementation is same as above but with float64)
+		if origStartIndex < 0 || origEndIndex > len(arr) || origStartIndex >= origEndIndex {
+			return []float64{}
+		}
+		segment := arr[origStartIndex:origEndIndex]
+		newSlice := make([]float64, len(segment))
+		copy(newSlice, segment)
+		for i, j := 0, len(newSlice)-1; i < j; i, j = i+1, j-1 {
+			newSlice[i], newSlice[j] = newSlice[j], newSlice[i]
+		}
+		return newSlice
+	}
+	sliceAndReverseInt := func(arr []int) []int {
+		// (Implementation is same as above but with int)
+		if origStartIndex < 0 || origEndIndex > len(arr) || origStartIndex >= origEndIndex {
+			return []int{}
+		}
+		segment := arr[origStartIndex:origEndIndex]
+		newSlice := make([]int, len(segment))
+		copy(newSlice, segment)
+		for i, j := 0, len(newSlice)-1; i < j; i, j = i+1, j-1 {
+			newSlice[i], newSlice[j] = newSlice[j], newSlice[i]
+		}
+		return newSlice
+	}
+
+	paginatedTimestamps := sliceAndReverse(data.Timestamps)
+
+	// --- FIX: PRICE FILTERING LOGIC ---
+	var paginatedPrices PriceData
+	if len(paginatedTimestamps) > 0 {
+		// The JS logic reverses prices first, then finds the index.
+		// So we must also reverse the price data before filtering.
+		reversedPriceTimestamps := make([]string, len(data.Prices.Timestamps))
+		copy(reversedPriceTimestamps, data.Prices.Timestamps)
+		for i, j := 0, len(reversedPriceTimestamps)-1; i < j; i, j = i+1, j-1 {
+			reversedPriceTimestamps[i], reversedPriceTimestamps[j] = reversedPriceTimestamps[j], reversedPriceTimestamps[i]
+		}
+
+		reversedPriceValues := make([]float64, len(data.Prices.Values))
+		copy(reversedPriceValues, data.Prices.Values)
+		for i, j := 0, len(reversedPriceValues)-1; i < j; i, j = i+1, j-1 {
+			reversedPriceValues[i], reversedPriceValues[j] = reversedPriceValues[j], reversedPriceValues[i]
+		}
+
+		// Find the end index based on the *last* (oldest) timestamp on the current page.
+		lastPaginatedTimestamp := paginatedTimestamps[len(paginatedTimestamps)-1]
+		priceEndIndex := findPriceEndIndex(reversedPriceTimestamps, lastPaginatedTimestamp)
+
+		if priceEndIndex != -1 {
+			paginatedPrices.Timestamps = reversedPriceTimestamps[:priceEndIndex+1]
+			paginatedPrices.Values = reversedPriceValues[:priceEndIndex+1]
+		}
+	} else {
+		// If there are no timestamps, there are no prices to show
+		paginatedPrices = PriceData{Timestamps: []string{}, Values: []float64{}}
+	}
+	// --- END OF PRICE FIX ---
+
+	paginatedResponse := &PaginatedFlowData{
+		FlowData: FlowData{
+			Timestamps:    paginatedTimestamps,
+			Prices:        paginatedPrices, // Use the newly filtered price data
+			Inflow:        make(map[string][]float64),
+			Outflow:       make(map[string][]float64),
+			Netflow:       make(map[string][]float64),
+			ActiveHolders: make(map[string][]int),
+			NetflowColors: make(map[string][]string),
+			NewAddresses:  sliceAndReverseInt(data.NewAddresses),
+		},
+		Page:       page,
+		TotalPages: totalPages,
+		TotalItems: totalItems,
+	}
+
+	for cat, v := range data.Inflow {
+		paginatedResponse.FlowData.Inflow[cat] = sliceAndReverseFloat(v)
+	}
+	for cat, v := range data.Outflow {
+		paginatedResponse.FlowData.Outflow[cat] = sliceAndReverseFloat(v)
+	}
+	for cat, v := range data.Netflow {
+		paginatedResponse.FlowData.Netflow[cat] = sliceAndReverseFloat(v)
+	}
+	for cat, v := range data.NetflowColors {
+		paginatedResponse.FlowData.NetflowColors[cat] = sliceAndReverse(v)
+	}
+	for cat, v := range data.ActiveHolders {
+		paginatedResponse.FlowData.ActiveHolders[cat] = sliceAndReverseInt(v)
+	}
+
+	return paginatedResponse
+}

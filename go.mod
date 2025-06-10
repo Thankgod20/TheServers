@@ -1,8 +1,8 @@
 module github.com/thankgod20/scraperServer
 
-go 1.23
+go 1.23.0
 
-toolchain go1.23.3
+toolchain go1.24.0
 
 require (
 	fyne.io/fyne/v2 v2.5.4
@@ -78,6 +78,7 @@ require (
 	golang.org/x/image v0.18.0 // indirect
 	golang.org/x/mobile v0.0.0-20231127183840-76ac6878050a // indirect
 	golang.org/x/net v0.25.0 // indirect
+	golang.org/x/sync v0.15.0 // indirect
 	golang.org/x/sys v0.26.0 // indirect
 	golang.org/x/term v0.20.0 // indirect
 	golang.org/x/text v0.16.0 // indirect

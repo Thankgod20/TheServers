@@ -1,8 +1,26 @@
 [
   {
     "id": 0,
-    "port": 51367,
-    "status": "inactive",
-    "updated": "2025-05-16T17:28:27+01:00"
+    "port": 0,
+    "status": "SHUTDOWN",
+    "updated": "2025-05-22T22:55:51.564469"
+  },
+  {
+    "id": 1,
+    "port": 0,
+    "status": "END",
+    "updated": "2025-05-22T22:55:38.591012"
+  },
+  {
+    "id": 2,
+    "port": 0,
+    "status": "END",
+    "updated": "2025-05-22T22:55:44.577259"
+  },
+  {
+    "id": 3,
+    "port": 0,
+    "status": "END",
+    "updated": "2025-05-22T22:55:50.547483"
   }
 ]

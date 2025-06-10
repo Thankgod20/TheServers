@@ -1,6 +1,8 @@
 package holders
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -60,172 +62,28 @@ func NewBitqueryClient() *BitqueryClient {
 	}
 }
 
-// UpdateAndGetTransfers now saves data to Redis instead of a JSON file.
-/*
-func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, error) {
-	// Set up Redis client.
-	//ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379", // Change if necessary.
-		Password: "",               // Set password if needed.
-		DB:       0,                // Default DB.
-	})
-
-	// Use a Redis key for storage.
-	redisKey := "holders:" + tokenAddress
-	unionMap := make(map[string]HolderInfo)
-	fileLimit := 1000
-
-	// Phase 1: Retrieve any existing data from Redis.
-	val, err := rdb.Get(redisKey).Result()
-	if err == nil && len(val) > 0 {
-		fileLimit = 100
-		var savedHolders []HolderInfo
-		if err := json.Unmarshal([]byte(val), &savedHolders); err != nil {
-			log.Printf("warning: could not unmarshal existing redis data, proceeding with empty list: %v", err)
-		} else {
-			for _, rec := range savedHolders {
-				unionMap[rec.Holder] = rec
-			}
-		}
-	} else if err != nil && err != redis.Nil {
-		log.Printf("error reading from redis: %v", err)
+// Compress data before saving
+func compress(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, err := gw.Write(data)
+	if err != nil {
+		return nil, err
 	}
-
-	// Build the GraphQL query using the determined limit.
-	query := fmt.Sprintf(`
-{
-  Solana {
-    Transfers(
-      where: {Transfer: {Currency: {MintAddress: {is: "%s"}}, Receiver: {Owner: {not: "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"}}}}
-      limit: { count: %d }
-      orderBy: { descending: Block_Slot }
-    ) {
-      Block {
-        Time
-      }
-      Transfer {
-        Amount
-        Receiver {
-          Address
-        }
-      }
-    }
-  }
+	gw.Close()
+	return buf.Bytes(), nil
 }
-`, tokenAddress, fileLimit)
 
-	payloadMap := map[string]string{
-		"query":     query,
-		"variables": "{}",
-	}
-	payloadBytes, err := json.Marshal(payloadMap)
+// Decompress when reading
+func decompress(data []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal payload: %v", err)
+		return nil, err
 	}
-
-	req, err := http.NewRequest("POST", c.APIURL, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Authorization", c.AuthToken)
-
-	clientHTTP := &http.Client{Timeout: 10 * time.Second}
-	resp, err := clientHTTP.Do(req)
-	if err != nil {
-		log.Printf("failed to execute Bitquery request: %v. Falling back to cached data...", err)
-		// Try to return the cached value from Redis
-		cached, redisErr := rdb.Get(redisKey).Result()
-		if redisErr != nil {
-			return "", fmt.Errorf("Bitquery error: %v; and redis fallback error: %v", err, redisErr)
-		}
-		return cached, nil
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	var bqResponse BitqueryResponse
-	if err := json.Unmarshal(body, &bqResponse); err != nil {
-		return "", fmt.Errorf("failed to unmarshal Bitquery response: %v", err)
-	}
-
-	// Append new Bitquery data to the union map, storing both time and amount.
-	for _, transfer := range bqResponse.Data.Solana.Transfers {
-		address := transfer.Transfer.Receiver.Address
-		if _, exists := unionMap[address]; !exists {
-			bqAmount, err := strconv.ParseFloat(transfer.Transfer.Amount, 64)
-			if err != nil {
-				log.Printf("failed to parse bitquery amount %s for address %s: %v", transfer.Transfer.Amount, address, err)
-				bqAmount = 0
-			}
-			unionMap[address] = HolderInfo{
-				Holder: address,
-				Time:   transfer.Block.Time,
-				Amount: bqAmount,
-			}
-		}
-	}
-
-	// Write the merged Bitquery data to Redis.
-	var mergedHolders []HolderInfo
-	for _, rec := range unionMap {
-		mergedHolders = append(mergedHolders, rec)
-	}
-	jsonOutput, err := json.MarshalIndent(mergedHolders, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("error marshalling merged data: %v", err)
-	}
-	if err := rdb.Set(redisKey, jsonOutput, 0).Err(); err != nil {
-		return "", fmt.Errorf("error saving merged data to redis: %v", err)
-	}
-
-	// Phase 2: Update amounts from current on‑chain data.
-	accounts := CurrentHolder(tokenAddress)
-	currentAmounts := make(map[string]float64)
-	for _, acct := range accounts {
-		data := acct.Account.Data.GetBinary()
-		if len(data) < 72 {
-			log.Printf("account data too short for %s", acct.Pubkey)
-			continue
-		}
-		amountRaw := decodeAmount(data[64:72])
-		currentAmounts[acct.Pubkey.String()] = float64(amountRaw)
-	}
-
-	// Update amounts in unionMap using on‑chain values.
-	for addr, rec := range unionMap {
-		if amt, ok := currentAmounts[addr]; ok {
-			rec.Amount = amt
-		}
-		unionMap[addr] = rec
-	}
-
-	// Write the final updated data to Redis.
-	var finalHolders []HolderInfo
-	for _, rec := range unionMap {
-		finalHolders = append(finalHolders, rec)
-	}
-	finalJSON, err := json.MarshalIndent(finalHolders, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("error marshalling final output: %v", err)
-	}
-	if err := rdb.Set(redisKey, finalJSON, 0).Err(); err != nil {
-		return "", fmt.Errorf("error saving final data to redis: %v", err)
-	}
-
-	// Retrieve and return the final data from Redis.
-	val, err = rdb.Get(redisKey).Result()
-	if err != nil {
-		return "", fmt.Errorf("error reading final data from redis: %v", err)
-	}
-	return val, nil
+	defer r.Close()
+	return ioutil.ReadAll(r)
 }
-*/
+
 // HolderInfo represents information about a holder/trade participant.
 
 // GTTradeAttributes reflects the structure of the attributes for each trade from GeckoTerminal.
@@ -299,14 +157,9 @@ func getPoolID(address string) (string, error) {
 }
 
 // UpdateAndGetTransfers now fetches trade data from GeckoTerminal and then updates holder amounts.
-func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, error) {
+/*
+func (c *BitqueryClient) UpdateAndGetTransfers(rdb *redis.Client, tokenAddress string) (string, error) {
 	// Set up Redis client.
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379", // Change if necessary.
-		Password: "",               // Set password if needed.
-		DB:       0,                // Default DB.
-	})
-
 	// Use a Redis key for storage.
 	redisKey := "holders:" + tokenAddress
 	unionMap := make(map[string]HolderInfo)
@@ -314,12 +167,13 @@ func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, err
 	//fileLimit := 1000
 
 	// Phase 1: Retrieve any existing data from Redis.
-	val, err := rdb.Get(redisKey).Result()
-	if err == nil && len(val) > 0 {
+	val_, err := rdb.Get(redisKey).Result()
+	if err == nil  {
+		val, _ := decompress([]byte(val_))
 		// If data exists, we reduce our fetch limit.
 		//fileLimit = 100
 		var savedHolders []HolderInfo
-		if err := json.Unmarshal([]byte(val), &savedHolders); err != nil {
+		if err := json.Unmarshal(val, &savedHolders); err != nil {
 			log.Printf("warning: could not unmarshal existing redis data, proceeding with empty list: %v", err)
 		} else {
 			for _, rec := range savedHolders {
@@ -350,11 +204,12 @@ func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, err
 	if err != nil {
 		log.Printf("failed to execute GeckoTerminal request: %v. Falling back to cached data...", err)
 		// Try to return the cached value from Redis.
-		cached, redisErr := rdb.Get(redisKey).Result()
+		cached_, redisErr := rdb.Get(redisKey).Result()
 		if redisErr != nil {
 			return "", fmt.Errorf("GeckoTerminal error: %v; and redis fallback error: %v", err, redisErr)
 		}
-		return cached, nil
+		cached, _ := decompress([]byte(cached_))
+		return string(cached), nil
 	}
 	defer resp.Body.Close()
 
@@ -410,24 +265,10 @@ func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("error marshalling merged data: %v", err)
 	}
-	if err := rdb.Set(redisKey, jsonOutput, 0).Err(); err != nil {
+	compressedData_, _ := compress(jsonOutput)
+	if err := rdb.Set(redisKey, compressedData_, 0).Err(); err != nil {
 		return "", fmt.Errorf("error saving merged data to redis: %v", err)
 	}
-
-	// Phase 2: Update amounts from current on‑chain data.
-	// Assume CurrentHolder is a function that returns an array of account data.
-	/*accounts := CurrentHolder(tokenAddress)
-	currentAmounts := make(map[string]float64)
-	for _, acct := range accounts {
-		data := acct.Account.Data.GetBinary()
-		if len(data) < 72 {
-			log.Printf("account data too short for %s", acct.Pubkey)
-			continue
-		}
-		amountRaw := decodeAmount(data[64:72])
-		currentAmounts[acct.Pubkey.String()] = float64(amountRaw)
-	}
-	fmt.Println("Current amount", currentAmounts)*/
 
 	holderBalances := GetCurrentHolders(tokenAddress, rdb)
 	//fmt.Println("Holder Details", holderBalances)
@@ -465,13 +306,7 @@ func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, err
 		}
 	}
 	// Update amounts in unionMap using on‑chain values.
-	/*
-		for addr, rec := range unionMap {
-			if amt, ok := currentAmounts[addr]; ok {
-				rec.Amount = amt
-			}
-			unionMap[addr] = rec
-		}*/
+
 
 	// Write the final updated data to Redis.
 	var finalHolders []HolderInfo
@@ -482,16 +317,205 @@ func (c *BitqueryClient) UpdateAndGetTransfers(tokenAddress string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("error marshalling final output: %v", err)
 	}
-	if err := rdb.Set(redisKey, finalJSON, 0).Err(); err != nil {
+	compressedData, _ := compress(finalJSON)
+	if err := rdb.Set(redisKey, compressedData, 0).Err(); err != nil {
 		return "", fmt.Errorf("error saving final data to redis: %v", err)
 	}
 
 	// Retrieve and return the final data from Redis.
-	val, err = rdb.Get(redisKey).Result()
+	val_, err = rdb.Get(redisKey).Result()
 	if err != nil {
 		return "", fmt.Errorf("error reading final data from redis: %v", err)
 	}
-	return val, nil
+	val, err := decompress([]byte(val_))
+	if err != nil {
+		fmt.Printf("error decompressing final data from redis: %v", err)
+	}
+	return string(val), nil
+}
+*/
+// fetchCachedHolders safely fetches and decodes holder data from Redis using a stream.
+func (c *BitqueryClient) fetchCachedHolders(rdb *redis.Client, redisKey string) (map[string]HolderInfo, error) {
+	unionMap := make(map[string]HolderInfo)
+	valStr, err := rdb.Get(redisKey).Result()
+	if err == redis.Nil {
+		return unionMap, nil // Key doesn't exist, return empty map
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error reading from redis: %w", err)
+	}
+
+	valBytes, err := decompress([]byte(valStr))
+	if err != nil {
+		return nil, fmt.Errorf("could not decompress existing redis data: %w", err)
+	}
+
+	// Use a streaming decoder for memory efficiency
+	decoder := json.NewDecoder(bytes.NewReader(valBytes))
+	// Expect an array `[`
+	if _, err := decoder.Token(); err != nil {
+		return nil, fmt.Errorf("invalid json format in cache (expected array start): %w", err)
+	}
+
+	for decoder.More() {
+		var holder HolderInfo
+		if err := decoder.Decode(&holder); err != nil {
+			log.Printf("warning: could not decode a holder from redis cache, skipping: %v", err)
+			continue
+		}
+		unionMap[holder.Holder] = holder
+	}
+
+	return unionMap, nil
+}
+func (c *BitqueryClient) fetchAndMergeGeckoTerminalTrades(poolID string, unionMap map[string]HolderInfo) error {
+	gtURL := "https://api.geckoterminal.com/api/v2/networks/solana/pools/" + poolID + "/trades?trade_volume_in_usd_greater_than=100"
+	req, err := http.NewRequest("GET", gtURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create GeckoTerminal request: %w", err)
+	}
+
+	clientHTTP := &http.Client{Timeout: 15 * time.Second}
+	resp, err := clientHTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute GeckoTerminal request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GeckoTerminal API returned non-200 status: %s", resp.Status)
+	}
+
+	// Use a streaming decoder on the response body
+	decoder := json.NewDecoder(resp.Body)
+	// Expect an object `{`
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("invalid json response from GT (expected object start): %w", err)
+	}
+
+	// Find the "data" key
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		if key, ok := token.(string); ok && key == "data" {
+			break // Found it, the next token will be the array start `[`
+		}
+	}
+
+	// Expect an array `[`
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("invalid json response from GT (expected data array start): %w", err)
+	}
+
+	for decoder.More() {
+		var trade GTTrade
+		if err := decoder.Decode(&trade); err != nil {
+			log.Printf("failed to decode a trade from GeckoTerminal, skipping: %v", err)
+			continue
+		}
+
+		addr := trade.Attributes.TxFromAddress
+		if addr == "" {
+			continue
+		}
+
+		// Only add new holders not seen before
+		if _, exists := unionMap[addr]; !exists && trade.Attributes.Kind == "buy" {
+			amount, _ := strconv.ParseFloat(trade.Attributes.ToTokenAmount, 64)
+			price, _ := strconv.ParseFloat(trade.Attributes.PriceToInUSD, 64)
+
+			unionMap[addr] = HolderInfo{
+				Holder: addr,
+				Time:   trade.Attributes.BlockTimestamp,
+				Amount: amount,
+				Price:  price,
+			}
+		}
+	}
+
+	return nil
+}
+func (c *BitqueryClient) synthesizeNewHolder(addr string, amount float64, recentPrice float64, index int) HolderInfo {
+	// Inverse exponential decay function to simulate a past time and price
+	decayFactor := 1.0 / (1 + math.Exp(float64(index)*0.1)) // Added a coefficient to make decay more gradual
+	pastTime := time.Now().Add(-time.Duration(decayFactor*10) * time.Minute)
+	newPrice := recentPrice * (1 - decayFactor)
+
+	return HolderInfo{
+		Holder: addr,
+		Amount: amount,
+		Time:   pastTime.Format(time.RFC3339),
+		Price:  newPrice,
+	}
+}
+
+func (c *BitqueryClient) UpdateAndGetTransfers(rdb *redis.Client, tokenAddress string) ([]byte, error) {
+	redisKey := "holders:" + tokenAddress
+
+	// Step 1: Fetch cached data efficiently.
+	unionMap, err := c.fetchCachedHolders(rdb, redisKey)
+	if err != nil {
+		return nil, fmt.Errorf("could not fetch cached holders: %w", err)
+	}
+
+	// Step 2: Fetch and merge new trade data from GeckoTerminal.
+	poolID, _ := getPoolID(tokenAddress)
+	if err := c.fetchAndMergeGeckoTerminalTrades(poolID, unionMap); err != nil {
+		// This is a non-fatal error; we can proceed with cached + on-chain data.
+		log.Printf("warning: could not fetch from GeckoTerminal, proceeding with existing data: %v", err)
+	}
+
+	// Step 3: Fetch current on-chain balances.
+	holderBalances := GetCurrentHolders(tokenAddress, rdb)
+
+	// Step 4: Update amounts and synthesize new holders in a single pass.
+	var recentPrice float64
+	// Find a recent price from the existing trade data to use as a baseline.
+	for _, rec := range unionMap {
+		if rec.Price > 0 {
+			recentPrice = rec.Price
+			break
+		}
+	}
+
+	newHolderCounter := 0
+	for addr, amount := range holderBalances {
+		if rec, exists := unionMap[addr]; exists {
+			rec.Amount = amount
+			unionMap[addr] = rec
+		} else if recentPrice > 0 { // Only synthesize if we have a price baseline
+			unionMap[addr] = c.synthesizeNewHolder(addr, amount, recentPrice, newHolderCounter)
+			newHolderCounter++
+		}
+	}
+
+	// Step 5: Convert final map to slice and marshal ONCE.
+	finalHolders := make([]HolderInfo, 0, len(unionMap))
+	for _, rec := range unionMap {
+		finalHolders = append(finalHolders, rec)
+	}
+
+	// Use standard Marshal for performance; Indent is for debugging.
+	finalJSON, err := json.Marshal(finalHolders)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling final output: %w", err)
+	}
+
+	// Step 6: Compress and write to Redis ONCE.
+	compressedData, err := compress(finalJSON)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compress final data: %w", err)
+	}
+
+	if err := rdb.Set(redisKey, compressedData, 0).Err(); err != nil {
+		// Log the error but still return the data, as the computation was successful.
+		log.Printf("warning: error saving final data to redis for key %s: %v", redisKey, err)
+	}
+
+	// Step 7: Return the in-memory data directly. No final read needed.
+	return finalJSON, nil
 }
 
 // decodeAmount decodes an 8-byte little-endian uint64 value.
@@ -542,7 +566,7 @@ type HolderSnapshot struct {
 
 // GetCurrentHolders returns a map of wallet addresses to token balances for the given token
 func GetCurrentHolders(tokenAddress string, rds *redis.Client) map[string]float64 {
-	quickNodeEndpoint := "https://sleek-wandering-tab.solana-mainnet.quiknode.pro/e5f4c26cc15290eda8ae67162a31a0070cf192d6"
+	quickNodeEndpoint := "https://light-ancient-pallet.solana-mainnet.quiknode.pro/6bb8bc30eb2438f8ee50d8ae8fb8425ab2dcdb97/"
 
 	jsonrpcClient := jsonrpc.NewClient(quickNodeEndpoint)
 	client := rpc.NewWithCustomRPCClient(jsonrpcClient)
@@ -550,13 +574,13 @@ func GetCurrentHolders(tokenAddress string, rds *redis.Client) map[string]float6
 	tokenMint := solana.MustPublicKeyFromBase58(tokenAddress)
 
 	// Get token decimals to properly convert raw amounts
-	tokenInfo, err := getTokenInfo(client, tokenMint)
+	/*tokenInfo, err := getTokenInfo(client, tokenMint)
 	if err != nil {
 		log.Printf("failed to get token info: %v", err)
-		return map[string]float64{} // Return empty map on error
+		//return map[string]float64{} // Return empty map on error
 	}
-	decimals := tokenInfo.Decimals
-
+	//decimals := tokenInfo.Decimals
+	//fmt.Printf("==== Token %s has %d decimals\n====", tokenMint, decimals)*/
 	// Find all token accounts for this mint
 	filters := []rpc.RPCFilter{
 		{
@@ -600,7 +624,7 @@ func GetCurrentHolders(tokenAddress string, rds *redis.Client) map[string]float6
 		owner := tokenAccountData.Owner.String()
 
 		// Convert raw amount to decimal representation
-		amount := float64(tokenAccountData.Amount) / math.Pow(10, float64(decimals))
+		amount := float64(tokenAccountData.Amount) / math.Pow(10, float64(uint8(6)))
 
 		// Add to our holders map, combining amounts if wallet has multiple token accounts
 		holderBalances[owner] += amount
@@ -629,13 +653,18 @@ func GetCurrentHolders(tokenAddress string, rds *redis.Client) map[string]float6
 
 	if exists == 1 {
 		// Key exists; retrieve existing snapshots.
-		val, err := rds.Get(redisKey).Result()
+		val_, err := rds.Get(redisKey).Result()
 		if err != nil {
 			log.Printf("failed to get existing snapshots from Redis: %v", err)
+			return nil
 		}
+		val, err := decompress([]byte(val_))
+		if err != nil {
+			log.Printf("failed to decompress existing snapshots: %v", err)
 
+		}
 		// Unmarshal the existing JSON array into the snapshots slice.
-		if err := json.Unmarshal([]byte(val), &snapshots); err != nil {
+		if err := json.Unmarshal((val), &snapshots); err != nil {
 			log.Printf("failed to unmarshal existing snapshots: %v", err)
 		}
 	}
@@ -648,9 +677,13 @@ func GetCurrentHolders(tokenAddress string, rds *redis.Client) map[string]float6
 	if err != nil {
 		log.Printf("failed to marshal snapshots to JSON: %v", err)
 	}
-
+	compressedData, err := compress(jsonData)
+	if err != nil {
+		log.Printf("failed to compress JSON data: %v", err)
+		//return holderBalances // Return current balances even if compression fails
+	}
 	// Store the updated JSON array back to Redis.
-	if err := rds.Set(redisKey, jsonData, 0).Err(); err != nil {
+	if err := rds.Set(redisKey, compressedData, 0).Err(); err != nil {
 		log.Printf("failed to store snapshots in Redis: %v", err)
 	}
 	return holderBalances

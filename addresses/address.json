@@ -1,122 +1,330 @@
 [
   {
-    "address": "3jWJNoQVKP6QPmzjQVqhcPx2LoofwY8xG5MEEg5Epump",
-    "name": "bought some redwood",
-    "symbol": "redwood",
+    "address": "E2hj1ibYxBB6A5tYQP5hgRMHqhG5Hen2kSqLBbnDpump",
+    "name": "The 0.23% Party",
+    "symbol": "0.23%",
     "index": 0,
-    "added_at": "2025-05-19T23:57:54.136496Z",
-    "last_activity": "2025-05-19T23:57:54.136496Z"
+    "added_at": "2025-06-07T01:17:57.787498Z",
+    "last_activity": "2025-06-07T01:17:57.787498Z"
   },
   {
-    "address": "C4JBaKAFAuMeo3FbbDEHxctCVqkwAXXpsHngrxUD5PUP",
-    "name": "Grok Real Name",
-    "symbol": "LUMEN",
+    "address": "HUdwPhsEg5cRJP2jmydXZ1ptD1NfgpJcZBPXcTyaY6aF",
+    "name": "The America Party",
+    "symbol": "TAP",
     "index": 1,
-    "added_at": "2025-05-20T00:01:28.044039Z",
-    "last_activity": "2025-05-20T00:01:28.044039Z"
+    "added_at": "2025-06-07T01:24:13.489253Z",
+    "last_activity": "2025-06-07T01:24:13.489253Z"
   },
   {
-    "address": "t5CiXaStxAGV57dgEz8DjXJaS9ic8iBxTuuHFMXpump",
+    "address": "sbLGEXi9vbv5r4sAP6xeUbKtjvquM5dji3d5cCCpump",
+    "name": "PF1337",
+    "symbol": "PUMP",
+    "index": 2,
+    "added_at": "2025-06-07T01:24:14.866615Z",
+    "last_activity": "2025-06-07T01:24:14.866615Z"
+  },
+  {
+    "address": "A8gYRxxiTZWmFScLhdxkEuJoGfcEvr9YND8tB61pump",
+    "name": "brainrot generator",
+    "symbol": "BG",
+    "index": 3,
+    "added_at": "2025-06-07T01:30:57.382715Z",
+    "last_activity": "2025-06-07T01:30:57.382715Z"
+  },
+  {
+    "address": "Hi39pUvmM3zrsmmdutBEP75e8EjQaAPtwuwyGWvpump",
     "name": "",
     "symbol": "",
-    "index": 2,
-    "added_at": "2025-05-20T00:01:38.001034Z",
-    "last_activity": "2025-05-20T00:01:38.001034Z"
+    "index": 4,
+    "added_at": "2025-06-07T01:34:28.941191Z",
+    "last_activity": "2025-06-07T01:34:28.941191Z"
   },
   {
-    "address": "E7ndZV7N5t5XAK4s6TC7nGX72UfZS6Dyb8YnbxfSpump",
-    "name": "Capitalism",
-    "symbol": "+",
-    "index": 3,
-    "added_at": "2025-05-20T00:10:38.877505Z",
-    "last_activity": "2025-05-20T00:10:38.877505Z"
+    "address": "Ta6KW4X6Rcy56AAu9pFZoiFHS7H5TcqU6KbdGUbpump",
+    "name": "bonk 2️⃣",
+    "symbol": "Henry",
+    "index": 5,
+    "added_at": "2025-06-07T01:42:52.735655Z",
+    "last_activity": "2025-06-07T01:42:52.735655Z"
   },
   {
-    "address": "zuLzq2EMuZCcAssStcRfEuEkqncGvqSSSxj2Ytapump",
+    "address": "CyzyzqEYN853exVVAWpkgcXLRTxCocK2zWC5aGn1pump",
+    "name": "Justice For Sewell",
+    "symbol": "SEWELL",
+    "index": 6,
+    "added_at": "2025-06-08T22:47:34.379256Z",
+    "last_activity": "2025-06-08T22:47:34.379256Z"
+  },
+  {
+    "address": "Fpzz6qXdpyVXQfFfFFWCCkc43a9KwnyWwxMXt3rPpump",
+    "name": "Pog",
+    "symbol": "Pog",
+    "index": 7,
+    "added_at": "2025-06-08T22:53:23.34407Z",
+    "last_activity": "2025-06-08T22:53:23.34407Z"
+  },
+  {
+    "address": "N97C8fCSi4tqoRx29QNKsESxBNsKvLar88ZfB6Epump",
+    "name": "WHO EATS THE AUTOCRAYON",
+    "symbol": "AUTOCRAYON",
+    "index": 8,
+    "added_at": "2025-06-08T23:03:59.244922Z",
+    "last_activity": "2025-06-08T23:03:59.244922Z"
+  },
+  {
+    "address": "6bq8kCaBGPiqjpwV2dACjT4S7aaynA5ZoQ61U3t4pump",
+    "name": "Grand Theft America",
+    "symbol": "GTA",
+    "index": 9,
+    "added_at": "2025-06-09T12:42:34.811029Z",
+    "last_activity": "2025-06-09T12:42:34.811029Z"
+  },
+  {
+    "address": "EFcfCEwKPxNn8qcurpywCHv4QkVzed3eBBJEGLWWpump",
+    "name": "Floki and The Clan",
+    "symbol": "Musso",
+    "index": 10,
+    "added_at": "2025-06-09T12:46:51.212007Z",
+    "last_activity": "2025-06-09T12:46:51.212007Z"
+  },
+  {
+    "address": "JB1wutSPix9kBXGWAFuo3a4PWXrDgvPRt2u4dhj2pump",
+    "name": "Agents AI",
+    "symbol": "AGENTS",
+    "index": 11,
+    "added_at": "2025-06-09T13:11:32.896166Z",
+    "last_activity": "2025-06-09T13:11:32.896166Z"
+  },
+  {
+    "address": "GeZGJXHiqrAxMsfQ5wmWR8ERoPJ4tPGFYvudNZQhpump",
+    "name": "fake solana",
+    "symbol": "fSOL",
+    "index": 12,
+    "added_at": "2025-06-09T13:15:18.596217Z",
+    "last_activity": "2025-06-09T13:15:18.596217Z"
+  },
+  {
+    "address": "BNv5ZkRA77VLKCGNgJMCxS6XyaQG5Y64s5MDxZ4spump",
+    "name": "Trail Cam Animals",
+    "symbol": "Trailcam",
+    "index": 13,
+    "added_at": "2025-06-09T13:26:42.095189Z",
+    "last_activity": "2025-06-09T13:26:42.095189Z"
+  },
+  {
+    "address": "mU83VJmLqRsmbDtzz1U4ELe7ds8qPuQS6Mm5QSppump",
     "name": "",
     "symbol": "",
-    "index": 4,
-    "added_at": "2025-05-20T00:11:16.476306Z",
-    "last_activity": "2025-05-20T00:11:16.476306Z"
+    "index": 14,
+    "added_at": "2025-06-09T13:27:25.079598Z",
+    "last_activity": "2025-06-09T13:27:25.079598Z"
   },
   {
-    "address": "AqxZ7v6MDzocgLpzeme9UrSLMvhyhEc3QXMQLQBHpump",
-    "name": "MIDGETCOIN",
-    "symbol": "MIDGET",
-    "index": 0,
-    "added_at": "2025-05-20T00:12:47.706914Z",
-    "last_activity": "2025-05-20T00:12:47.706914Z"
+    "address": "BYmaX6WcC77Y6hhWUe5Pp1QUUnAzaDrzixjcLi3pump",
+    "name": "HODL",
+    "symbol": "HODL",
+    "index": 15,
+    "added_at": "2025-06-09T13:37:43.957201Z",
+    "last_activity": "2025-06-09T13:37:43.957201Z"
   },
   {
-    "address": "3VTebPiH3p1srqmZXSMS7fS9FHEMnLFUKbWFrqkSsoW4",
-    "name": "We Made It",
-    "symbol": "WMI",
-    "index": 1,
-    "added_at": "2025-05-20T00:14:02.87928Z",
-    "last_activity": "2025-05-20T00:14:02.87928Z"
+    "address": "5kryaYK1afJvmrWN4LA6wDTn1iaAdDknBArWkVh4pump",
+    "name": "we fly thick",
+    "symbol": "buttlines",
+    "index": 16,
+    "added_at": "2025-06-09T13:43:23.761634Z",
+    "last_activity": "2025-06-09T13:43:23.761634Z"
   },
   {
-    "address": "Hr6gNqwmt9mPBEviTQTtZQZjsEELx8extRLS7aKvpump",
-    "name": "Officer Waylon",
-    "symbol": "WAYLON",
-    "index": 2,
-    "added_at": "2025-05-20T00:15:38.527666Z",
-    "last_activity": "2025-05-20T00:15:38.527666Z"
+    "address": "8hKi5ZKCuY5CFBwHD6nLAX4t3W9HBWWRLBQXChqJpump",
+    "name": "like a caveman discovering fire",
+    "symbol": "EARLY",
+    "index": 17,
+    "added_at": "2025-06-09T13:49:13.430707Z",
+    "last_activity": "2025-06-09T13:49:13.430707Z"
   },
   {
-    "address": "8HtfkKWLZqcPdgE2imD2UPpfduiDhyApzmoPAQP6pump",
-    "name": "the perfect coin",
-    "symbol": "1.618",
-    "index": 3,
-    "added_at": "2025-05-20T00:22:46.289871Z",
-    "last_activity": "2025-05-20T00:22:46.289871Z"
+    "address": "8migwqDJohaVJwoDwcWMADNSrAccXcTW8Q3NbfJNNXyW",
+    "name": "OMalley",
+    "symbol": "OMALLEY",
+    "index": 18,
+    "added_at": "2025-06-09T14:00:10.009206Z",
+    "last_activity": "2025-06-09T14:00:10.009206Z"
   },
   {
-    "address": "34WLGj9B9N1k5JAcmTqbYnCQEa49SozNSNeJCPnFpump",
-    "name": "Fat Pepe",
-    "symbol": "FATPEPE",
-    "index": 4,
-    "added_at": "2025-05-20T00:25:59.495334Z",
-    "last_activity": "2025-05-20T00:25:59.495334Z"
+    "address": "8e2btxvSPepD9w9bmeRMDYFL7z27yz3aQzCTP5CQpump",
+    "name": "Volatility Index",
+    "symbol": "VIX",
+    "index": 19,
+    "added_at": "2025-06-09T14:03:06.2333Z",
+    "last_activity": "2025-06-09T14:03:06.2333Z"
   },
   {
-    "address": "HmnebKYS83zQr1gVJXQVga3gzCgSAoJriRNJvVt4sjgv",
-    "name": "Pika",
-    "symbol": "PIKA",
-    "index": 0,
-    "added_at": "2025-05-20T00:39:53.493636Z",
-    "last_activity": "2025-05-20T00:39:53.493636Z"
+    "address": "Ck9mVHFjSJaXA1HqRGngQHEqAYvrEdNjDCVnS5HSpump",
+    "name": "Grok Codex",
+    "symbol": "CODEX",
+    "index": 20,
+    "added_at": "2025-06-09T14:07:39.803159Z",
+    "last_activity": "2025-06-09T14:07:39.803159Z"
   },
   {
-    "address": "3AxWhauXf1eA3MywnN4npdZg8yEi89dTRtZYqH8Xpump",
-    "name": "Gooba",
-    "symbol": "Gooba",
-    "index": 1,
-    "added_at": "2025-05-20T00:41:39.030681Z",
-    "last_activity": "2025-05-20T00:41:39.030681Z"
+    "address": "4YUmmVa7rTfGjHJb3uDDKjYsEefH9Mxko1KPtgT7pump",
+    "name": "Truth Terminals Memehouse",
+    "symbol": "MEMEHOUSE",
+    "index": 21,
+    "added_at": "2025-06-09T14:11:28.874209Z",
+    "last_activity": "2025-06-09T14:11:28.874209Z"
   },
   {
-    "address": "96HRLRNzCzPKmbcWmxZRAxnwQiteWaKtqJcaXpFZpump",
-    "name": "LUCK.İO",
-    "symbol": "Luck",
-    "index": 2,
-    "added_at": "2025-05-20T00:43:00.334464Z",
-    "last_activity": "2025-05-20T00:43:00.334464Z"
+    "address": "E7sCppZx7mnwwiZyNrLutgTPAxme2e1pLzj2nHydpump",
+    "name": "Maxwell",
+    "symbol": "MAX",
+    "index": 22,
+    "added_at": "2025-06-09T14:14:03.721432Z",
+    "last_activity": "2025-06-09T14:14:03.721432Z"
   },
   {
-    "address": "CoW5AxDEH5S7Y58WV7VV77fDChUp68a3QWywr1Ctpump",
-    "name": "wizard dot fun",
-    "symbol": "wizard",
-    "index": 3,
-    "added_at": "2025-05-20T00:43:36.235871Z",
-    "last_activity": "2025-05-20T00:43:36.235871Z"
+    "address": "GqwshG195yUw7tgxAU1Mpgo8BTJuQyPNHYCjMvZQpump",
+    "name": "Odyra API",
+    "symbol": "ODYRA",
+    "index": 23,
+    "added_at": "2025-06-09T14:20:56.584436Z",
+    "last_activity": "2025-06-09T14:20:56.584436Z"
   },
   {
-    "address": "2hA11SswqwSWHUaGBq4e8kPbrkx6DQprZiYZi5a2X7Cr",
-    "name": "i accept the",
-    "symbol": "TERMS",
-    "index": 4,
-    "added_at": "2025-05-20T00:44:01.264144Z",
-    "last_activity": "2025-05-20T00:44:01.264144Z"
+    "address": "qQeQsPcHYxubx6gqJXbis9GxHdamtENkzb6pdbdpump",
+    "name": "Ko-chan",
+    "symbol": "Ko-chan",
+    "index": 24,
+    "added_at": "2025-06-09T14:22:38.238781Z",
+    "last_activity": "2025-06-09T14:22:38.238781Z"
+  },
+  {
+    "address": "8WdjPosshWTToQNaDGdKiy6CB7ZGNYURWahG9Empump",
+    "name": "Birkini Labs",
+    "symbol": "Birkini",
+    "index": 25,
+    "added_at": "2025-06-09T14:36:30.982726Z",
+    "last_activity": "2025-06-09T14:36:30.982726Z"
+  },
+  {
+    "address": "5oFXGr6Zb86zmRSaTvCp3RyfhLVLtT2rjKL3nKdopump",
+    "name": "ZYN COIN",
+    "symbol": "ZYN",
+    "index": 26,
+    "added_at": "2025-06-09T14:38:42.535591Z",
+    "last_activity": "2025-06-09T14:38:42.535591Z"
+  },
+  {
+    "address": "5aPACVNgMg4mpJzHd2dSeDrEYo44rtrnkKB54KNVpump",
+    "name": "Initial Pump Offering ",
+    "symbol": "IPO",
+    "index": 27,
+    "added_at": "2025-06-09T14:43:01.045493Z",
+    "last_activity": "2025-06-09T14:43:01.045493Z"
+  },
+  {
+    "address": "5Dc2ze9in5k5arkM35nqkeUoRAnAt2MuCyeBJnPzrNjR",
+    "name": "Ko-chan",
+    "symbol": "Ko-chan",
+    "index": 28,
+    "added_at": "2025-06-09T14:46:27.956319Z",
+    "last_activity": "2025-06-09T14:46:27.956319Z"
+  },
+  {
+    "address": "3uFQToDtTQXsm7YoYLuRSShUV5yYHoteKAuzRNjSpump",
+    "name": "HODLWOOD",
+    "symbol": "HODL",
+    "index": 29,
+    "added_at": "2025-06-09T14:46:35.346256Z",
+    "last_activity": "2025-06-09T14:46:35.346256Z"
+  },
+  {
+    "address": "Cpk5UBaFLF3x2Qs6ddgAoJfLQcAhMnQWxv7esYjo9kAY",
+    "name": "Dire Wolf",
+    "symbol": "DWF",
+    "index": 30,
+    "added_at": "2025-06-09T14:55:38.363967Z",
+    "last_activity": "2025-06-09T14:55:38.363967Z"
+  },
+  {
+    "address": "HH4aF86rfWnBiYbDnL3M8Hv5NUG9V9GxcuGYSPAZ2V8T",
+    "name": "Khaleesi",
+    "symbol": "KHALEESI",
+    "index": 31,
+    "added_at": "2025-06-09T14:56:16.108624Z",
+    "last_activity": "2025-06-09T14:56:16.108624Z"
+  },
+  {
+    "address": "7spHmntRA2pqJdsiSdCq8dHzKhLSw8DzjDTUDosUpump",
+    "name": "fing ",
+    "symbol": "fing",
+    "index": 32,
+    "added_at": "2025-06-09T15:08:30.312155Z",
+    "last_activity": "2025-06-09T15:08:30.312155Z"
+  },
+  {
+    "address": "FSJCBBYrkM7uMYcRJVwXDpZEikwFfZMbRoC3gL5Ypump",
+    "name": "This will age well",
+    "symbol": "WineCoin",
+    "index": 33,
+    "added_at": "2025-06-09T15:12:40.335885Z",
+    "last_activity": "2025-06-09T15:12:40.335885Z"
+  },
+  {
+    "address": "8Sfc3AkFdMn6hEkWE7s5km6zAyGQ3uoNRbqTpnfXpump",
+    "name": "",
+    "symbol": "",
+    "index": 34,
+    "added_at": "2025-06-09T15:12:44.283665Z",
+    "last_activity": "2025-06-09T15:12:44.283665Z"
+  },
+  {
+    "address": "GESopFG7koneQ1KA9o3gDZYDkN5Bv37MdAMTBaarpump",
+    "name": "LA CTO",
+    "symbol": "LACTO",
+    "index": 35,
+    "added_at": "2025-06-09T15:21:12.089206Z",
+    "last_activity": "2025-06-09T15:21:12.089206Z"
+  },
+  {
+    "address": "12TLRaa39ULSYrsWkStBKmHcE3VkjfQ5LKCtYtqbsend",
+    "name": "Farcaster - pump",
+    "symbol": "$FCP",
+    "index": 36,
+    "added_at": "2025-06-09T15:26:41.226052Z",
+    "last_activity": "2025-06-09T15:26:41.226052Z"
+  },
+  {
+    "address": "6eW528bggYHaAJ6SZUT7bhkhHqKseaBNKTFn1ztspump",
+    "name": "Kou-chan",
+    "symbol": "Kou-chan",
+    "index": 37,
+    "added_at": "2025-06-09T15:30:57.868083Z",
+    "last_activity": "2025-06-09T15:30:57.868083Z"
+  },
+  {
+    "address": "FrMCBtwTomjMtkLg2DtWrFnDBmQnxHyDw176YMWCpump",
+    "name": "\"Wings of Light\" ",
+    "symbol": "Aura Bird",
+    "index": 38,
+    "added_at": "2025-06-09T15:35:07.482321Z",
+    "last_activity": "2025-06-09T15:35:07.482321Z"
+  },
+  {
+    "address": "BgKj9ESYQEAsbwYG7chD6mwGz7gHGXHEK2nXVTYGpump",
+    "name": "COREMESH",
+    "symbol": "CM",
+    "index": 39,
+    "added_at": "2025-06-09T15:37:32.017195Z",
+    "last_activity": "2025-06-09T15:37:32.017195Z"
+  },
+  {
+    "address": "5RFt7XFqESd8LoNEryYt3XtawZkt8uG7ohPL8J6upump",
+    "name": "SOLANA TIMER",
+    "symbol": "TIMER",
+    "index": 40,
+    "added_at": "2025-06-09T15:40:51.015605Z",
+    "last_activity": "2025-06-09T15:40:51.015605Z"
   }
 ]

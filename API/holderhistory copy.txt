@@ -1,0 +1,314 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/go-redis/redis"
+)
+
+// NOTE: compress and decompress functions are assumed to be defined elsewhere in your project.
+// Example placeholders:
+// func compress(data []byte) ([]byte, error) { ... }
+// func decompress(data []byte) ([]byte, error) { ... }
+
+const (
+	CacheTTL               = 5 * time.Minute
+	RawDataRedisKeyPattern = "holderhistory:%s" // For fetching raw data
+	CacheKeyPattern        = "history:%s"       // For caching processed data
+)
+
+// ----- Type Definitions (Unchanged) -----
+
+type UpstreamHolderData struct {
+	Amount []float64 `json:"amount"`
+	Time   []string  `json:"time"`
+}
+
+type UpstreamRawResponse struct {
+	Holders []UpstreamHolderData `json:"holders"`
+}
+
+type AggregatedEntry_ struct {
+	Time    string  `json:"time"`
+	Holders float64 `json:"holders"`
+}
+
+type PaginatedResponse struct {
+	History    []AggregatedEntry_ `json:"history"`
+	Page       int                `json:"page"`
+	TotalPages int                `json:"totalPages"`
+	TotalItems int                `json:"totalItems"`
+}
+
+// ----- Handler and Dependencies (Unchanged) -----
+
+type Handler struct {
+	redisClient *redis.Client
+	refreshing  map[string]bool
+	mu          sync.Mutex
+}
+
+func NewHandler(redisClient *redis.Client) *Handler {
+	return &Handler{
+		redisClient: redisClient,
+		refreshing:  make(map[string]bool),
+	}
+}
+
+// ----- Core Logic (Refactored) -----
+
+// NEW FUNCTION: streamAndProcess performs memory-efficient aggregation using a JSON stream.
+// It avoids loading the entire raw data set into memory.
+func (h *Handler) streamAndProcess(ctx context.Context, dataStream io.Reader, address string) ([]AggregatedEntry_, error) {
+	holderDataAggregated := make(map[string]float64) // time_string -> total_amount
+	decoder := json.NewDecoder(dataStream)
+
+	// Navigate to the start of the "holders" array in the JSON stream
+	// Expected format: {"holders": [ ... ]}
+	if _, err := decoder.Token(); err != nil { // Read "{"
+		return nil, fmt.Errorf("error reading opening brace from JSON stream: %w", err)
+	}
+	if _, err := decoder.Token(); err != nil { // Read "holders" key
+		return nil, fmt.Errorf("error reading 'holders' key from JSON stream: %w", err)
+	}
+	if _, err := decoder.Token(); err != nil { // Read "["
+		return nil, fmt.Errorf("error reading opening bracket of 'holders' array: %w", err)
+	}
+
+	// Process one holder at a time from the stream
+	for decoder.More() {
+		var holder UpstreamHolderData
+		if err := decoder.Decode(&holder); err != nil {
+			log.Printf("Warning: Could not decode a holder entry for %s: %v. Skipping.", address, err)
+			continue
+		}
+
+		if len(holder.Amount) != len(holder.Time) {
+			log.Printf("Warning: Mismatch in amount/time array lengths for a holder of %s. Skipping.", address)
+			continue
+		}
+
+		for i, tsStr := range holder.Time {
+			parsedTime, err := time.Parse(time.RFC3339Nano, tsStr)
+			if err != nil {
+				parsedTime, err = time.Parse("2006-01-02T15:04:05Z07:00", tsStr)
+				if err != nil {
+					continue // Skip if time cannot be parsed
+				}
+			}
+
+			roundedTime := parsedTime.Truncate(time.Minute)
+			formattedTime := roundedTime.UTC().Format(time.RFC3339)
+			holderDataAggregated[formattedTime] += holder.Amount[i]
+		}
+	}
+
+	// Convert the aggregated map to a slice
+	result := make([]AggregatedEntry_, 0, len(holderDataAggregated))
+	for t, totalAmount := range holderDataAggregated {
+		result = append(result, AggregatedEntry_{Time: t, Holders: totalAmount})
+	}
+
+	// Sort by time descending (most recent first)
+	sort.Slice(result, func(i, j int) bool {
+		ti, _ := time.Parse(time.RFC3339, result[i].Time)
+		tj, _ := time.Parse(time.RFC3339, result[j].Time)
+		return ti.After(tj)
+	})
+
+	return result, nil
+}
+
+// REFACTORED: fetchAndProcessRawData now orchestrates the fetch and stream processing.
+func (h *Handler) fetchAndProcessRawData(ctx context.Context, address string) ([]AggregatedEntry_, error) {
+	rawRedisKey := fmt.Sprintf(RawDataRedisKeyPattern, address)
+	log.Printf("Fetching raw data from Redis key: %s", rawRedisKey)
+
+	rawJSONDataStr, err := h.redisClient.Get(rawRedisKey).Result()
+	if err == redis.Nil {
+		log.Printf("Raw data not found in Redis for key %s", rawRedisKey)
+		return []AggregatedEntry_{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error fetching raw data from redis for %s: %w", rawRedisKey, err)
+	}
+
+	rawJSONData, err := decompress([]byte(rawJSONDataStr))
+	if err != nil {
+		return nil, fmt.Errorf("error decompressing raw data for %s: %w", address, err)
+	}
+
+	// Create a reader from the raw data and pass it to the streaming processor.
+	// This avoids allocating the large UpstreamRawResponse struct.
+	dataStream := bytes.NewReader(rawJSONData)
+	return h.streamAndProcess(ctx, dataStream, address)
+}
+
+// ----- HTTP Handler and Helpers (Unchanged) -----
+
+// GetHistory is the HTTP handler function
+func (h *Handler) GetHistory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	address := r.URL.Query().Get("address")
+	pageStr := r.URL.Query().Get("page")
+	limitStr := r.URL.Query().Get("limit")
+
+	if address == "" {
+		http.Error(w, `{"error": "Missing address"}`, http.StatusBadRequest)
+		return
+	}
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page < 1 {
+		page = 1
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit < 1 {
+		limit = 50
+	}
+
+	cacheKey := fmt.Sprintf(CacheKeyPattern, address)
+
+	cachedDataStr, err := h.redisClient.Get(cacheKey).Result()
+	if err == nil {
+		var aggregatedData []AggregatedEntry_
+		cachedData, err := decompress([]byte(cachedDataStr))
+		if err != nil {
+			log.Printf("Error decompressing cached data for %s: %v", address, err)
+		} else if err := json.Unmarshal(cachedData, &aggregatedData); err == nil {
+			log.Printf("Cache hit for %s", address)
+			h.triggerBackgroundRefresh(ctx, address)
+			h.respondWithJSON(w, http.StatusOK, paginate(aggregatedData, page, limit))
+			return
+		}
+		log.Printf("Error unmarshalling cached data for %s: %v. Re-fetching.", address, err)
+	} else if err != redis.Nil {
+		log.Printf("Redis error getting cache for %s: %v. Re-fetching.", address, err)
+	}
+
+	log.Printf("Cache miss for %s, fetching and processing", address)
+	data, err := h.fetchAndProcessRawData(ctx, address)
+	if err != nil {
+		log.Printf("Error fetching and processing data for %s: %v", address, err)
+		http.Error(w, `{"error": "Internal Server Error during data processing"}`, http.StatusInternalServerError)
+		return
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Error marshalling data for cache for %s: %v", address, err)
+	} else {
+		compressedData, err := compress(jsonData)
+		if err != nil {
+			log.Printf("Error compressing data for cache for %s: %v", address, err)
+		} else if err := h.redisClient.Set(cacheKey, compressedData, CacheTTL).Err(); err != nil {
+			log.Printf("Error setting cache for %s: %v", address, err)
+		}
+	}
+
+	h.respondWithJSON(w, http.StatusOK, paginate(data, page, limit))
+}
+
+// triggerBackgroundRefresh refreshes the cache for the given address in the background.
+func (h *Handler) triggerBackgroundRefresh(ctx context.Context, address string) {
+	h.mu.Lock()
+	if h.refreshing[address] {
+		h.mu.Unlock()
+		return
+	}
+	h.refreshing[address] = true
+	h.mu.Unlock()
+
+	log.Printf("Triggering background refresh for %s", address)
+
+	go func() {
+		defer func() {
+			h.mu.Lock()
+			delete(h.refreshing, address)
+			h.mu.Unlock()
+		}()
+
+		bgCtx := context.Background()
+		data, err := h.fetchAndProcessRawData(bgCtx, address)
+		if err != nil {
+			log.Printf("Background refresh failed for %s: %v", address, err)
+			return
+		}
+
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			log.Printf("Background refresh: error marshalling data for %s: %v", address, err)
+			return
+		}
+		compressedData, err := compress(jsonData)
+		if err != nil {
+			log.Printf("Background refresh: error compressing data for %s: %v", address, err)
+			return
+		}
+
+		cacheKey := fmt.Sprintf(CacheKeyPattern, address)
+		if err := h.redisClient.Set(cacheKey, compressedData, CacheTTL).Err(); err != nil {
+			log.Printf("Background refresh: error setting cache for %s: %v", address, err)
+		} else {
+			log.Printf("Cache refreshed in background for %s", address)
+		}
+	}()
+}
+
+// paginate takes a slice of data and returns a paginated subset.
+func paginate(data []AggregatedEntry_, page, limit int) PaginatedResponse {
+	totalItems := len(data)
+	totalPages := 0
+	if totalItems > 0 && limit > 0 {
+		totalPages = int(math.Ceil(float64(totalItems) / float64(limit)))
+	}
+
+	start := (page - 1) * limit
+	end := start + limit
+
+	if start > totalItems {
+		start, end = totalItems, totalItems
+	} else if end > totalItems {
+		end = totalItems
+	}
+
+	var paginatedData []AggregatedEntry_
+	if start < end {
+		paginatedData = data[start:end]
+	} else {
+		paginatedData = []AggregatedEntry_{}
+	}
+
+	return PaginatedResponse{
+		History:    paginatedData,
+		Page:       page,
+		TotalPages: totalPages,
+		TotalItems: totalItems,
+	}
+}
+
+// respondWithJSON is a helper to write JSON responses
+func (h *Handler) respondWithJSON(w http.ResponseWriter, statusCode int, payload interface{}) {
+	response, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshalling JSON response: %v", err)
+		http.Error(w, `{"error":"Failed to marshal response"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if _, err := w.Write(response); err != nil {
+		log.Printf("Error writing response: %v", err)
+	}
+}

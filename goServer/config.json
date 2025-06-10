@@ -1,0 +1,13 @@
+{
+    "apiBaseURL": "http://localhost:3300",
+    "smtpHost": "",
+    "smtpPort": 587,
+    "smtpUser": "",
+    "smtpPassword": "",
+    "emailSenderName": "Crypto Flow Alert",
+    "emailRecipient": "",
+    "whaleFlowThreshold": 10000000.0,
+    "excludeAddrs": {
+      "some_address_to_exclude": true
+    }
+  }
